@@ -27,6 +27,10 @@ export default defineConfig(({ env }) => {
     fixedExtension: false,
     dts: false,
     clean: false,
-    plugins: client ? [] : [typertPlugin({ mode: 'workspace', faces: ['host'] })],
+    plugins: client ? [] : [typertPlugin({
+      mode: 'workspace',
+      faces: ['host'],
+      excludePackages: ['@deepseek-ai/dsh-experimental-autodev'],
+    })],
   }
 })

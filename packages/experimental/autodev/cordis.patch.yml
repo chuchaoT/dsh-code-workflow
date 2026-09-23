@@ -1,0 +1,3 @@
+- insert:
+    - id: autodev
+      name: '@deepseek-ai/dsh-experimental-autodev'

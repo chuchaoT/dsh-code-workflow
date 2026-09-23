@@ -33,6 +33,8 @@ export interface TypertPluginOptions {
   readonly mode?: 'package' | 'workspace'
   /** Independent TypeScript program faces included in this phase. */
   readonly faces?: readonly TypertFace[]
+  /** Optional workspace contributors to leave to a package-local focused build. */
+  readonly excludePackages?: readonly string[]
 }
 
 /**
@@ -84,9 +86,14 @@ export function typertPlugin(pluginOptions: TypertPluginOptions = {}): TypertPlu
       let artifacts = artifactsByRoot.get(root)
       if (artifacts === undefined) {
         const generator = new WorkspaceTypertGenerator(root, TSC_VERIFIED_INPUT)
-        artifacts = pluginOptions.faces === undefined
-          ? generator.generate()
-          : generator.generate(undefined, pluginOptions.faces)
+        const selected = pluginOptions.mode === 'package' && manifest.name !== undefined
+          ? [manifest.name]
+          : undefined
+        artifacts = selected !== undefined
+          ? generator.generate(selected, pluginOptions.faces)
+          : pluginOptions.faces === undefined
+            ? generator.generate()
+            : generator.generate(undefined, pluginOptions.faces)
         artifactsByRoot.set(root, artifacts)
       }
       emitArtifacts(packageDir, artifacts.filter(candidate => candidate.package === manifest.name))
@@ -96,6 +103,7 @@ export function typertPlugin(pluginOptions: TypertPluginOptions = {}): TypertPlu
   function emitWorkspace(root: string, faces: readonly TypertFace[] | undefined): void {
     const generator = new WorkspaceTypertGenerator(root, TSC_VERIFIED_INPUT)
     const packages = generator.discover(faces)
+      .filter(candidate => !pluginOptions.excludePackages?.includes(candidate.package))
       .filter(candidate => hasTypertExport(readManifest(join(root, candidate.root)).exports))
       .map(candidate => candidate.package)
     if (packages.length === 0) return
@@ -153,7 +161,7 @@ function packageRoot(start: string, workspace: string): string | undefined {
 
 function workspaceRoot(start: string): string {
   let current = resolve(start)
-  while (!existsSync(join(current, 'tsconfig.host.json'))) {
+  while (!existsSync(join(current, 'tsconfig.host.json')) || !existsSync(join(current, 'packages'))) {
     const parent = dirname(current)
     if (parent === current) throw new Error(`typert-generator: cannot find workspace root above ${start}`)
     current = parent
