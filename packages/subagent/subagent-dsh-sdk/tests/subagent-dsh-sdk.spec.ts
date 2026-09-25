@@ -216,6 +216,27 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     }
   })
 
+  it('uses an explicit per-run workspace cwd instead of the parent cwd', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'subagent-dsh-sdk-workspace-cwd-'))
+    const recordFile = join(tmp, 'init.jsonl')
+    try {
+      const ctx = await setup({ FAKE_RECORD_INIT: recordFile })
+      const run = await ctx.subagents.start('dsh-sdk', { ...request(), workspaceCwd: tmp })
+      await run.result
+      await run.dispose()
+      const { readFileSync } = await import('node:fs')
+      const records = readFileSync(recordFile, 'utf8').trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+      expect(records).toEqual([{
+        cwd: tmp,
+        provider: 'fake-provider',
+        model: 'fake-model',
+      }])
+      await ctx.fiber.dispose()
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
   it('preserves instance defaults around a partial request override', async () => {
     const tmp = mkdtempSync(join(tmpdir(), 'subagent-dsh-sdk-partial-route-'))
     const recordFile = join(tmp, 'init.jsonl')
@@ -830,6 +851,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
       depthLimit: false,
       toolFilter: false,
       persona: false,
+      workspaceCwd: true,
     })
     await fiber.dispose()
     expect(ctx.subagents.getProvider('sdk-hmr')).toBeUndefined()

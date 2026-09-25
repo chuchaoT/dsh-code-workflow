@@ -1,6 +1,7 @@
 /** Deterministic Evidence -> Verification evaluation. */
 
 import type {
+  CandidateRevision,
   Evidence,
   EvidenceStatus,
   EvidenceType,
@@ -10,13 +11,24 @@ import type {
   VerificationResult,
 } from './contracts.ts'
 
+/** Aggregated result produced from persisted Evidence and Runtime checks. */
 export interface VerificationEvaluation {
   readonly status: EvidenceStatus
   readonly results: readonly Omit<VerificationResult, 'id' | 'createdAt'>[]
   readonly summary: string
 }
 
+/**
+ * Create the required completion checks for one active Plan.
+ *
+ * @param run - Run that owns the verification checks.
+ * @param plan - Active immutable Plan version.
+ * @param createdAt - Timestamp shared by the generated checks.
+ * @returns Baseline, Build, Test, Review and Side Effect checks for the Plan.
+ */
 export function defaultVerificationChecks(run: Run, plan: PlanVersion, createdAt: string): readonly VerificationCheck[] {
+  const buildNodeId = plan.nodes.find(node => node.kind === 'build')?.id
+  const testNodeId = plan.nodes.find(node => node.kind === 'test')?.id
   return [
     {
       id: `${run.id}:${plan.id}:baseline`, runId: run.id, planId: plan.id, kind: 'baseline',
@@ -25,11 +37,13 @@ export function defaultVerificationChecks(run: Run, plan: PlanVersion, createdAt
     },
     {
       id: `${run.id}:${plan.id}:build`, runId: run.id, planId: plan.id, kind: 'build',
+      ...(buildNodeId === undefined ? {} : { nodeId: buildNodeId }),
       evidenceType: 'BUILD', required: true,
       description: 'The candidate must pass the deterministic build command', createdAt,
     },
     {
       id: `${run.id}:${plan.id}:test`, runId: run.id, planId: plan.id, kind: 'test',
+      ...(testNodeId === undefined ? {} : { nodeId: testNodeId }),
       evidenceType: 'TEST', required: true,
       description: 'The candidate must pass the deterministic test command', createdAt,
     },
@@ -46,16 +60,37 @@ export function defaultVerificationChecks(run: Run, plan: PlanVersion, createdAt
   ]
 }
 
+/**
+ * Evaluate checks using only Evidence from the check's Run and Plan.
+ *
+ * Build, Test and Review Evidence must match the active Candidate's Git tree hash. Other non-baseline Evidence must
+ * belong to that Candidate. Baseline Evidence is Run-scoped and may omit a Plan id because Runtime captures it before
+ * executing the Plan.
+ *
+ * @param checks - Runtime-owned acceptance checks.
+ * @param evidence - Persisted Evidence available to the Run.
+ * @param candidate - Candidate whose output is being verified, if one exists.
+ * @returns Check results and an aggregate status; unmatched required checks remain UNKNOWN.
+ */
 export function evaluateVerification(
   checks: readonly VerificationCheck[],
   evidence: readonly Evidence[],
-  _now: string,
-  candidateId?: string,
+  candidate?: Pick<CandidateRevision, 'id' | 'runId' | 'planId' | 'gitTreeHash' | 'attempt'>,
 ): VerificationEvaluation {
   const results = checks.map((check) => {
     const matching = evidence
-      .filter(item => item.type === check.evidenceType)
-      .filter(item => check.kind === 'baseline' || candidateId === undefined || item.candidateId === candidateId)
+      .filter(item => item.runId === check.runId && item.type === check.evidenceType)
+      .filter((item) => {
+        if (check.kind === 'baseline') return item.planId === undefined || item.planId === check.planId
+        if (candidate === undefined || candidate.runId !== check.runId || candidate.planId !== check.planId) return false
+        if (item.candidateId !== candidate.id || item.planId !== check.planId) return false
+        if (candidate.attempt !== undefined && item.attempt !== candidate.attempt) return false
+        if (check.nodeId !== undefined && item.nodeId !== check.nodeId) return false
+        if (check.kind === 'build' || check.kind === 'test' || check.kind === 'review') {
+          return item.gitTreeHash === candidate.gitTreeHash
+        }
+        return true
+      })
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
     const latest = matching.at(-1)
     if (latest === undefined) {

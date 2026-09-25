@@ -750,6 +750,122 @@ export interface Config {
 
 来源： [`packages/experimental/api-speech-to-text/src/index.ts:20`](../packages/experimental/api-speech-to-text/src/index.ts)
 
+<a id="deepseek-aidsh-experimental-autodev"></a>
+
+## `@deepseek-ai/dsh-experimental-autodev`
+
+需要： `tools`
+
+```ts config-catalog
+/** Bundle settings for storage, execution limits, decisions, and routing. */
+export interface AutoDevConfig {
+  /** Root directory for the SQLite database and run artifacts. */
+  readonly dataRoot?: string
+  /** Managed parent directory for Git Worktrees created by AutoDev. */
+  readonly worktreeRoot?: string
+  /** Maximum number of explicit implementation attempts for one Run. */
+  readonly maxAttempts?: number
+  /** Timeout for Agent and other bounded command operations. */
+  readonly commandTimeoutMs?: number
+  /** Timeout applied to Build driver execution. */
+  readonly buildTimeoutMs?: number
+  /** Timeout applied to Test driver execution. */
+  readonly testTimeoutMs?: number
+  /** Minimum Jev quality score accepted without an additional Gate. */
+  readonly qualityMinScore?: number
+  /** Jev endpoint, decision mode, confidence policy, and request limits. */
+  readonly jev?: JevConfig
+  /** Named Provider selection policies available to Runs. */
+  readonly routes?: Readonly<Record<string, RoutePolicy>>
+  /** Maven executable and argument overrides. */
+  readonly maven?: MavenConfig
+  /** Select one detected project driver, or fail clearly on ambiguous auto-detection. */
+  readonly buildDriver?: BuildDriverId | 'auto'
+  /** Root-project command overrides for Maven, Gradle, Node, and pytest. */
+  readonly drivers?: Partial<Record<BuildDriverId, DriverCommandSettings>>
+}
+
+/** Jev transport, retry, confidence, and data-sharing settings. */
+export interface JevConfig {
+  /** Whether Jev is required, advisory, or disabled. */
+  readonly mode?: JevMode
+  /** HTTP endpoint used for Jev decision requests. */
+  readonly endpoint?: string
+  /** Jev model name sent with the request. */
+  readonly model?: string
+  /** Environment variable name that contains the API key. */
+  readonly apiKeyEnv?: string
+  /** Per-request time limit in milliseconds. */
+  readonly timeoutMs?: number
+  /** Number of bounded retries after a transient request failure. */
+  readonly retryCount?: number
+  /** Per-purpose confidence thresholds for accepting Jev answers. */
+  readonly minConfidence?: Partial<Record<DecisionPurpose, number>>
+  /** Version identifier for the decision question set. */
+  readonly questionSetVersion?: string
+  /** Whether repository paths may be included in Jev context. */
+  readonly sendPaths?: boolean
+}
+
+/** Selection policy and ordered candidates for one task route. */
+export interface RoutePolicy {
+  /** Providers eligible for this route, in preference order. */
+  readonly candidates: readonly RouteCandidate[]
+  /** Capabilities a task and candidate must both satisfy. */
+  readonly requiredTaskTraits?: readonly string[]
+  /** Minimum confidence required before Jev can select a candidate. */
+  readonly minConfidence?: number
+}
+
+/** Maven-specific executable and argument overrides. */
+export interface MavenConfig {
+  /** Arguments used for the Maven Build stage. */
+  readonly buildArgs?: readonly string[]
+  /** Arguments used for the Maven Test stage. */
+  readonly testArgs?: readonly string[]
+  /** Maven executable name or absolute path. */
+  readonly executable?: string
+}
+
+/** Supported deterministic Build/Test driver identifiers. */
+export type BuildDriverId = 'maven' | 'gradle' | 'node' | 'pytest'
+
+/** Executable and argv overrides for one Build/Test driver. */
+export interface DriverCommandSettings {
+  /** Executable name or absolute path. */
+  readonly executable?: string
+  /** Arguments used for the Build stage. */
+  readonly buildArgs?: readonly string[]
+  /** Arguments used for the Test stage. */
+  readonly testArgs?: readonly string[]
+}
+
+/** Policy for handling Jev availability and confidence. */
+export type JevMode = 'required' | 'advisory' | 'off'
+
+/** Jev decision categories used by the Runtime policy. */
+export type DecisionPurpose = 'agent-route' | 'failure-action' | 'quality' | 'completion'
+
+/** One Provider choice considered by a named route. */
+export interface RouteCandidate {
+  /** Adapter category used to invoke the Provider. */
+  readonly kind: RouteKind
+  /** Registered Provider name. */
+  readonly provider: string
+  /** Optional model identifier passed to the adapter. */
+  readonly model?: string
+  /** Whether route selection may consider this candidate. */
+  readonly enabled?: boolean
+  /** Capabilities the candidate declares for task matching. */
+  readonly traits?: readonly string[]
+}
+
+/** Execution mechanism used by a Provider route candidate. */
+export type RouteKind = 'subagent' | 'command' | 'model'
+```
+
+来源： [`packages/experimental/autodev/src/contracts.ts:103`](../packages/experimental/autodev/src/contracts.ts)
+
 <a id="deepseek-aidsh-experimental-browser-use-chrome-devtools-mcp"></a>
 
 ## `@deepseek-ai/dsh-experimental-browser-use-chrome-devtools-mcp`

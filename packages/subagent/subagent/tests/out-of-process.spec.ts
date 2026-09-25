@@ -27,6 +27,7 @@ describe('NO_START_CAPABILITIES', () => {
       depthLimit: false,
       toolFilter: false,
       persona: false,
+      workspaceCwd: false,
     })
     expect(Object.isFrozen(NO_START_CAPABILITIES)).toBe(true)
   })
@@ -88,11 +89,13 @@ describe('child cwd resolution', () => {
     }
   })
 
-  it('resolveChildCwd: override wins, else the parent session cwd validates, else loud failure', () => {
+  it('resolveChildCwd: per-run cwd wins, then config, then validated parent cwd', () => {
+    expect(resolveChildCwd('p', tmpdir(), undefined, process.cwd())).toBe(process.cwd())
     expect(resolveChildCwd('p', tmpdir(), undefined)).toBe(tmpdir())
     expect(resolveChildCwd('p', undefined, tmpdir())).toBe(tmpdir())
     expect(() => resolveChildCwd('p', undefined, undefined)).toThrow('no working directory for the child')
     expect(() => resolveChildCwd('p', undefined, 'relative/parent')).toThrow('parent session cwd must be an absolute path')
+    expect(() => resolveChildCwd('p', tmpdir(), undefined, 'relative/worktree')).toThrow('requested workspace cwd must be an absolute path')
   })
 })
 

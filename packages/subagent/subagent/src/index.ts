@@ -648,9 +648,10 @@ export class SubagentRuntime extends TypertRemoteService {
       { when: request.maxDepth !== undefined, cap: 'depthLimit' },
       { when: request.toolFilter !== undefined, cap: 'toolFilter' },
       { when: request.persona !== undefined, cap: 'persona' },
+      { when: request.workspaceCwd !== undefined, cap: 'workspaceCwd' },
     ]
     for (const { when, cap } of needs) {
-      if (when && !provider.capabilities[cap]) {
+      if (when && provider.capabilities[cap] !== true) {
         throw new SubagentError(
           `subagent provider "${provider.name}" does not support the "${cap}" capability`,
           'UNSUPPORTED_CAPABILITY',

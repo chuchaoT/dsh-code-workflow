@@ -590,12 +590,17 @@ describe('task admission and package contracts', () => {
     queryMock.mockImplementation(({ options }) => {
       expect(options).not.toHaveProperty('model')
       expect(options.permissionMode).toBe(DEFAULT_CLAUDE_CODE_PERMISSION_MODE)
+      expect(options.cwd).toBe(process.cwd())
       options.spawnClaudeCodeProcess!(sdkSpawnOptions())
       return queryFrom([success('native model answer')])
     })
     claudeCode.apply(ctx, { env: {}, disposeGraceMs: 3_000 })
     expect(ctx.subagents.getProvider('claude-code')).toBeDefined()
-    const run = await ctx.subagents.start('claude-code', request())
+    const run = await ctx.subagents.start('claude-code', {
+      ...request(),
+      parent: { id: 'parent-without-cwd', session: { header: {} } } as unknown as Agent,
+      workspaceCwd: process.cwd(),
+    })
     await expect(run.result).resolves.toEqual({
       output: [{ type: 'text', text: 'native model answer' }],
       stopReason: 'completed',

@@ -270,6 +270,43 @@ describe('dsh-subagent-spawn-in-process', () => {
     await parentHandle.dispose()
   })
 
+  it('uses an explicit per-run workspace cwd for the child session', async () => {
+    const { ctx } = await setup([textResponse('x')])
+    const parentHandle = await ctx.agents.create({
+      sessionId: SessionId('cwd-override-parent-session'),
+      meta: { cwd: process.cwd() },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+    const worktree = `${process.cwd()}/packages`
+    const run = await start(ctx, 'spawn', {
+      prompt: [{ type: 'text', text: 'p' }],
+      parent: parentHandle.agent,
+      workspaceCwd: worktree,
+    })
+    await run.result
+    const child = ctx.agents.get(run.id)!
+    expect(child.session.header.cwd).toBe(worktree)
+    await run.dispose()
+    await parentHandle.dispose()
+  })
+
+  it('rejects an unusable explicit workspace cwd before creating a child', async () => {
+    const { ctx } = await setup([textResponse('x')])
+    const parentHandle = await ctx.agents.create({
+      sessionId: SessionId('cwd-invalid-parent-session'),
+      meta: { cwd: process.cwd() },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+    const before = ctx.agents.list().length
+    await expect(start(ctx, 'spawn', {
+      prompt: [{ type: 'text', text: 'p' }],
+      parent: parentHandle.agent,
+      workspaceCwd: 'relative/not-a-worktree',
+    })).rejects.toThrow('requested workspace cwd must be an absolute path')
+    expect(ctx.agents.list()).toHaveLength(before)
+    await parentHandle.dispose()
+  })
+
   it('uses request.agentOptions.model when the parent has no model of its own', async () => {
     const { ctx } = await setup([textResponse('explicit model child')])
     // A parent with NO model (its own turns would need one supplied per-request).
@@ -299,6 +336,7 @@ describe('dsh-subagent-spawn-in-process', () => {
       depthLimit: true,
       toolFilter: true,
       persona: true,
+      workspaceCwd: true,
     })
   })
 

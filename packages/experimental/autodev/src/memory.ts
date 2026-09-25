@@ -6,12 +6,14 @@ import type {
   MemoryKind,
   MemorySearchHit,
   ProjectMemory,
-  ProvenanceRef,
+  SourceReference,
   ScopeRef,
 } from './contracts.ts'
 import { AutoDevStore } from './store.ts'
 import { confidence, normalizeScope, unique } from './semantics.ts'
+import { sameScope, scopeSpecificity, type ScopeQuery } from './scope.ts'
 
+/** Scoped Memory content plus optional lifecycle, source references, and expiry metadata. */
 export interface RememberInput {
   readonly scope: ScopeRef
   readonly kind: MemoryKind
@@ -20,21 +22,27 @@ export interface RememberInput {
   readonly tags?: readonly string[]
   readonly status?: KnowledgeStatus
   readonly confidence?: number
-  readonly provenance?: readonly ProvenanceRef[]
+  readonly sourceRefs?: readonly SourceReference[]
   readonly evidenceIds?: readonly string[]
   readonly supersedesId?: string
   readonly expiresAt?: string
 }
 
+/** Result-count and content limits for Memory retrieval. */
 export interface MemorySearchOptions {
   readonly limit?: number
   readonly maxChars?: number
   readonly includeDeprecated?: boolean
 }
 
+/** Persists project-scoped Memory and exposes bounded progressive retrieval. */
 export class ProjectMemoryService {
   constructor(readonly store: AutoDevStore) {}
 
+  /** Create a candidate Memory record with normalized scope and source references.
+   * @param input - Memory content, scope, and optional source metadata.
+   * @returns The persisted candidate Memory record.
+   */
   remember(input: RememberInput): ProjectMemory {
     const now = new Date().toISOString()
     const memory: ProjectMemory = {
@@ -46,7 +54,7 @@ export class ProjectMemoryService {
       tags: unique(input.tags ?? []),
       status: input.status ?? 'CANDIDATE',
       confidence: confidence(input.confidence),
-      provenance: [...(input.provenance ?? [])],
+      sourceRefs: [...(input.sourceRefs ?? [])],
       evidenceIds: unique(input.evidenceIds ?? []),
       version: 1,
       ...(input.supersedesId === undefined ? {} : { supersedesId: input.supersedesId }),
@@ -58,22 +66,37 @@ export class ProjectMemoryService {
     return memory
   }
 
+  /** Read one Memory record by its durable identifier.
+   * @param id - Memory record identity.
+   * @returns The record, or `undefined` when no such record exists.
+   */
   get(id: string): ProjectMemory | undefined {
     return this.store.getMemory(id)
   }
 
-  list(projectKey: string, includeDeprecated: boolean = false): readonly ProjectMemory[] {
-    return this.store.listMemories(projectKey).filter(item => includeDeprecated || item.status !== 'DEPRECATED')
+  /** List records applicable to a project scope.
+   * @param scope - Project and optional version dimensions to match.
+   * @param includeDeprecated - Whether to retain deprecated records in the result.
+   * @returns Scoped Memory records.
+   */
+  list(scope: ScopeQuery, includeDeprecated: boolean = false): readonly ProjectMemory[] {
+    return this.store.listMemories(scope).filter(item => includeDeprecated || item.status !== 'DEPRECATED')
   }
 
-  search(projectKey: string, query: string, options: MemorySearchOptions = {}): readonly MemorySearchHit[] {
+  /** Search scoped Memory and return ranked, bounded summaries with match reasons.
+   * @param scope - Project and optional version dimensions to match.
+   * @param query - Natural-language terms used for retrieval.
+   * @param options - Optional result-count, character, and lifecycle filters.
+   * @returns Ranked Memory hits with content limited to the requested budget.
+   */
+  search(scope: ScopeQuery, query: string, options: MemorySearchOptions = {}): readonly MemorySearchHit[] {
     const normalizedQuery = normalize(query)
     if (normalizedQuery === '') return []
     const queryTokens = tokens(query)
     const now = new Date().toISOString()
     const limit = clamp(options.limit ?? 8, 1, 50)
     const maxChars = clamp(options.maxChars ?? 1000, 32, 12_000)
-    return this.list(projectKey, options.includeDeprecated === true)
+    return this.list(scope, options.includeDeprecated === true)
       .filter(item => item.expiresAt === undefined || item.expiresAt > now)
       .map((memory) => {
         const haystack = normalize(`${memory.title} ${memory.content} ${memory.tags.join(' ')}`)
@@ -87,10 +110,21 @@ export class ProjectMemoryService {
         }
       })
       .filter(item => item.score > 0)
-      .sort((a, b) => b.score - a.score || b.memory.confidence - a.memory.confidence || a.memory.id.localeCompare(b.memory.id))
+      .sort((a, b) =>
+        b.score - a.score ||
+        scopeSpecificity(b.memory.scope) - scopeSpecificity(a.memory.scope) ||
+        b.memory.confidence - a.memory.confidence ||
+        a.memory.id.localeCompare(b.memory.id),
+      )
       .slice(0, limit)
   }
 
+  /** Update a Memory lifecycle status and retain the supplied Evidence references.
+   * @param id - Memory identity to update.
+   * @param status - Non-candidate lifecycle status to apply.
+   * @param evidenceIds - Additional Evidence IDs associated with this version.
+   * @returns The persisted Memory version.
+   */
   setStatus(id: string, status: Exclude<KnowledgeStatus, 'CANDIDATE'>, evidenceIds: readonly string[] = []): ProjectMemory {
     const current = this.store.getMemory(id)
     if (current === undefined) throw new Error(`memory ${id} does not exist`)
@@ -106,9 +140,13 @@ export class ProjectMemoryService {
     return next
   }
 
-  /** Deterministically deprecate exact duplicates while retaining provenance. */
+  /** Deterministically deprecate exact duplicates while retaining the canonical record.
+   * @param scope - Exact project scope to compact.
+   * @returns A report identity and the IDs deprecated by this operation.
+   */
   compact(scope: ScopeRef): { readonly reportId: string; readonly deprecatedIds: readonly string[] } {
-    const memories = [...this.list(normalizeScope(scope).projectKey, true)].filter(item => item.status !== 'DEPRECATED')
+    const normalizedScope = normalizeScope(scope)
+    const memories = [...this.store.listMemories(normalizedScope)].filter(item => sameScope(item.scope, normalizedScope) && item.status !== 'DEPRECATED')
     const canonical = new Map<string, ProjectMemory>()
     const deprecatedIds: string[] = []
     for (const memory of memories.sort((a, b) => b.confidence - a.confidence || a.createdAt.localeCompare(b.createdAt))) {
@@ -125,16 +163,29 @@ export class ProjectMemoryService {
   }
 }
 
+/** Normalize case and whitespace for deterministic text comparisons.
+ * @param value - Text to normalize.
+ * @returns Trimmed, lower-case text with internal whitespace collapsed.
+ */
 export function normalize(value: string): string {
   return value.trim().toLocaleLowerCase().replace(/\s+/g, ' ')
 }
 
+/** Extract unique Unicode word tokens used by scoped search and Concept matching.
+ * @param value - Text to tokenize.
+ * @returns Unique normalized tokens longer than one character.
+ */
 export function tokens(value: string): readonly string[] {
   const normalized = normalize(value)
   const words = normalized.match(/[\p{L}\p{N}_-]+/gu) ?? []
   return [...new Set(words.filter(item => item.length > 1))]
 }
 
+/** Truncate text to a character budget and mark the omitted tail.
+ * @param value - Text to bound.
+ * @param maxChars - Maximum output length before the truncation marker.
+ * @returns Original text when it fits, otherwise a bounded prefix and marker.
+ */
 export function truncate(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value
   return `${value.slice(0, Math.max(0, maxChars - 14))}… [truncated]`

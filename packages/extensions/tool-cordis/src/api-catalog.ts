@@ -543,6 +543,420 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     ],
   },
   {
+    key: 'autodev',
+    summary: 'Main Host-owned AutoDev service.',
+    description: 'Main Host-owned AutoDev service.',
+    methods: [
+      {
+        signature: 'readonly store: AutoDevStore',
+        description: 'Durable repository for Runs, Evidence, decisions, and project knowledge.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly commands: CommandExecutor',
+        description: 'Bounded command executor used by Git and build/test drivers.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly git: GitManager',
+        description: 'Worktree creation, drift checks, and verified promotion service.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly decisions: DecisionCoordinator',
+        description: 'Jev-backed decision coordinator used by routing and human decisions.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly router: ProviderRouter',
+        description: 'Dynamic provider registry and route selector.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly protocol: AgentProtocol',
+        description: 'Agent task, context, cancellation, and signal contract service.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly semantics: SemanticService',
+        description: 'Assumption and semantic uncertainty lifecycle service.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly memory: ProjectMemoryService',
+        description: 'Scope-aware project memory retrieval and budgeting service.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly concepts: BusinessConceptService',
+        description: 'Business concept and observation service.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly playbooks: PlaybookService',
+        description: 'Reusable, scope-aware playbook service.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly knowledge: KnowledgeService',
+        description: 'Evidence-backed knowledge, compaction, and regression service.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly sideEffects: SideEffectService',
+        description: 'Approval and idempotency ledger for external side effects.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly config: ResolvedAutoDevConfig',
+        description: 'Fully resolved and validated runtime settings.',
+        parameters: [],
+      },
+      {
+        signature: '@Remote(\'list\') listRuns(): readonly Run[]',
+        description: 'List the durable Runs available to the profile\'s Web dashboard.',
+        parameters: [],
+        returns: 'Runs ordered by most recent update.',
+      },
+      {
+        signature: '@Remote(\'createBackup\') async remoteCreateBackup( request: { readonly destinationPath: string }, signal: AbortSignal, ): Promise<AutoDevBackupManifest>',
+        description: 'Create a verified backup in a new operator-selected directory.',
+        parameters: [{ name: 'request', description: 'New destination path outside the live AutoDev data root.' }, { name: 'signal', description: 'DSH Remote cancellation signal; cancellation is checked before the backup is published.' }],
+        returns: 'The backup manifest, whose file paths are relative to the backup.',
+      },
+      {
+        signature: '@Remote(\'restoreBackup\') async remoteRestoreBackup( request: { readonly backupPath: string readonly targetDataRoot: string readonly confirmedTargetDataRoot: string }, signal: AbortSignal, ): Promise<AutoDevBackupManifest>',
+        description: 'Restore a verified backup to a new operator-selected data root.',
+        parameters: [{ name: 'request', description: 'Backup directory, new target, and the exact target path typed by the operator for confirmation.' }, { name: 'signal', description: 'DSH Remote cancellation signal; cancellation is checked before the restored directory is published.' }],
+        returns: 'The verified backup manifest; the running Store is not switched to the restored root.',
+      },
+      {
+        signature: '@Remote(\'retentionPreview\') remoteRetentionPreview(request: { readonly minAgeDays?: number }, signal: AbortSignal): AutoDevRetentionPreview',
+        description: 'Return a path-free, read-only preview of Worktrees eligible for retention.',
+        parameters: [{ name: 'request', description: 'Optional minimum terminal age in days; defaults to 30.' }, { name: 'signal', description: 'DSH Remote cancellation signal.' }],
+        returns: 'Eligible and protected Worktrees plus an observed-state fingerprint.',
+      },
+      {
+        signature: '@Remote(\'retentionCleanupJobs\') remoteRetentionCleanupJobs(): readonly AutoDevCleanupJobView[]',
+        description: 'List path-free retention Cleanup Jobs for recovery and audit review.',
+        parameters: [],
+        returns: 'Recent durable Jobs without filesystem paths or user identity claims.',
+      },
+      {
+        signature: '@Remote(\'prepareRetentionCleanup\') remotePrepareRetentionCleanup(request: PrepareRetentionCleanupRequest): AutoDevCleanupJobView',
+        description: 'Persist an explicit bounded selection without deleting or modifying any Worktree.',
+        parameters: [{ name: 'request', description: 'Idempotency key, exact current preview fingerprint, and selected IDs.' }],
+        returns: 'A path-free Job and the exact text required for its second confirmation.',
+      },
+      {
+        signature: '@Remote(\'executeRetentionCleanup\') async remoteExecuteRetentionCleanup( request: ExecuteRetentionCleanupRequest, signal: AbortSignal, ): Promise<AutoDevCleanupJobView>',
+        description: 'Execute or resume a confirmed Cleanup Job after rechecking the current Preview and each target.',
+        parameters: [{ name: 'request', description: 'Job id, freshly observed fingerprint, and the UI\'s typed confirmation phrase.' }, { name: 'signal', description: 'DSH Remote cancellation signal; an individual Git removal is allowed to settle once claimed.' }],
+        returns: 'Latest path-free durable Job state.',
+      },
+      {
+        signature: '@Remote(\'cancelRetentionCleanup\') remoteCancelRetentionCleanup(jobId: string): AutoDevCleanupJobView',
+        description: 'Cancel a prepared Job before any filesystem operation has been authorized.',
+        parameters: [{ name: 'jobId', description: 'Job to cancel.' }],
+        returns: 'The latest path-free Job.',
+      },
+      {
+        signature: '@Remote(\'snapshot\') remoteSnapshot(runId: string): AutoDevSnapshot',
+        description: 'Read one authoritative Run snapshot.',
+        parameters: [{ name: 'runId', description: 'The Run to inspect.' }],
+        returns: 'The current persisted Run state and related records.',
+      },
+      {
+        signature: '@Remote(\'providers\') remoteProviders(): ProviderCatalog',
+        description: 'Read the registered Providers and configured routes.',
+        parameters: [],
+        returns: 'A detached Provider and route catalog.',
+      },
+      {
+        signature: '@Remote(\'create\') async remoteCreate(request: CreateRunRequest, signal: AbortSignal): Promise<AutoDevSnapshot>',
+        description: 'Create a Run and immutable Plan for Web review without starting a Provider.',
+        parameters: [{ name: 'request', description: 'Local repository, task, acceptance checks, and optional Driver.' }, { name: 'signal', description: 'Cancellation of repository inspection.' }],
+        returns: 'The persisted Run snapshot for review.',
+      },
+      {
+        signature: '@Remote(\'approvePlan\') remoteApprovePlan(request: { readonly runId: string; readonly planId: string }): AutoDevSnapshot',
+        description: 'Record explicit approval for exactly the Plan shown to the caller.',
+        parameters: [{ name: 'request', description: 'Run and reviewed Plan version identifiers.' }],
+        returns: 'The ready Run with an auditable approval Evidence item.',
+      },
+      {
+        signature: '@Remote(\'start\') async remoteStart(request: { readonly runId: string; readonly sessionId: string }, signal: AbortSignal): Promise<AutoDevSnapshot>',
+        description: 'Start an approved Plan from an ordinary DSH Session bound to this repository. The Run outlives this short Remote call and can be observed via snapshot.',
+        parameters: [{ name: 'request', description: 'Run and framework-bound Session identities.' }, { name: 'signal', description: 'Cancellation only for admission, not the background Run.' }],
+        returns: 'The latest durable snapshot after execution has been admitted.',
+      },
+      {
+        signature: '@Remote(\'memorySearch\') remoteMemorySearch(request: { readonly runId: string readonly query: string readonly limit?: number readonly maxChars?: number }): readonly MemorySearchHit[]',
+        description: 'Search bounded Memory records within the Run\'s derived project scope.',
+        parameters: [{ name: 'request', description: 'The Run, query, and optional result limits.' }],
+        returns: 'Matching summaries that apply to the Run\'s scope.',
+      },
+      {
+        signature: '@Remote(\'memoryDetail\') remoteMemoryDetail(request: { readonly runId: string; readonly memoryId: string }): ProjectMemory | undefined',
+        description: 'Read one Memory record after checking its scope against the Run.',
+        parameters: [{ name: 'request', description: 'The Run and Memory identifiers.' }],
+        returns: 'The scoped record, or `undefined` when it does not exist.',
+      },
+      {
+        signature: '@Remote(\'semanticState\') remoteSemanticState(runId: string): { readonly assumptions: AutoDevSnapshot[\'assumptions\']; readonly uncertainties: AutoDevSnapshot[\'uncertainties\'] }',
+        description: 'Read the open semantic decisions associated with one Run.',
+        parameters: [{ name: 'runId', description: 'The Run whose assumptions and uncertainties are requested.' }],
+        returns: 'The Run\'s assumptions and currently open uncertainties.',
+      },
+      {
+        signature: '@Remote(\'concepts\') remoteConcepts(runId: string): readonly BusinessConcept[]',
+        description: 'Search Concepts using the Run\'s request and project scope.',
+        parameters: [{ name: 'runId', description: 'The Run that supplies the query and scope.' }],
+        returns: 'Up to eight matching Concepts.',
+      },
+      {
+        signature: '@Remote(\'conceptDetail\') remoteConceptDetail(request: { readonly runId: string; readonly conceptId: string }): BusinessConcept | undefined',
+        description: 'Read a Concept only when it belongs to the Run\'s scope.',
+        parameters: [{ name: 'request', description: 'The Run and Concept identifiers.' }],
+        returns: 'The scoped Concept, or `undefined` when it does not exist.',
+      },
+      {
+        signature: '@Remote(\'conceptHistory\') remoteConceptHistory(request: { readonly runId: string; readonly conceptId: string }): AutoDevSnapshot[\'conceptObservations\']',
+        description: 'Read observations for a Concept after validating its scope.',
+        parameters: [{ name: 'request', description: 'The Run and Concept identifiers.' }],
+        returns: 'Observations for the selected Concept in the Run\'s scope.',
+      },
+      {
+        signature: '@Remote(\'observeConcept\') remoteObserveConcept(request: { readonly runId: string readonly key: string readonly name: string readonly definition: string readonly target: string readonly effect: string readonly evidenceSummary: string readonly evidenceIds?: readonly string[] readonly confidence?: number }): AutoDevSnapshot',
+        description: 'Add an Agent or operator observation to a project Concept.',
+        parameters: [{ name: 'request', description: 'The Run, Concept observation, and optional Evidence references.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'correctConcept\') remoteCorrectConcept(request: { readonly runId: string readonly key: string readonly name: string readonly definition: string readonly target: string readonly effect: string readonly evidenceSummary: string readonly resolution: string readonly evidenceIds?: readonly string[] }): AutoDevSnapshot',
+        description: 'Record an explicit human correction for a project Concept.',
+        parameters: [{ name: 'request', description: 'The Run, corrected definition, and resolution rationale.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'playbooks\') remotePlaybooks(runId: string): readonly Playbook[]',
+        description: 'List relevant Playbooks for the Run\'s project scope.',
+        parameters: [{ name: 'runId', description: 'The Run that supplies the scope and request.' }],
+        returns: 'Up to eight applicable Playbooks.',
+      },
+      {
+        signature: '@Remote(\'playbookDetail\') remotePlaybookDetail(request: { readonly runId: string; readonly playbookId: string }): Playbook',
+        description: 'Read one Playbook after validating its project scope.',
+        parameters: [{ name: 'request', description: 'The Run and Playbook identifiers.' }],
+        returns: 'The requested Playbook.',
+      },
+      {
+        signature: '@Remote(\'createPlaybook\') remoteCreatePlaybook(request: { readonly runId: string readonly key: string readonly name: string readonly purpose: string readonly targets: readonly string[] readonly effects: readonly string[] readonly conceptKeys?: readonly string[] readonly exclusions?: readonly string[] readonly steps: readonly string[] readonly requiredEvidence?: readonly EvidenceType[] }): AutoDevSnapshot',
+        description: 'Create a Run-scoped Draft Playbook for later human activation.',
+        parameters: [{ name: 'request', description: 'Scoped Playbook content authored from this Run.' }],
+        returns: 'The updated project snapshot.',
+      },
+      {
+        signature: '@Remote(\'revisePlaybook\') remoteRevisePlaybook(request: { readonly runId: string readonly playbookId: string readonly name: string readonly purpose: string readonly targets: readonly string[] readonly effects: readonly string[] readonly conceptKeys?: readonly string[] readonly exclusions?: readonly string[] readonly steps: readonly string[] readonly requiredEvidence?: readonly EvidenceType[] readonly resolution: string }): AutoDevSnapshot',
+        description: 'Revise an applicable Playbook as a new immutable version. The operation forces Plan re-review before a non-Draft Run can continue.',
+        parameters: [{ name: 'request', description: 'Prior version, revised content, and human rationale.' }],
+        returns: 'The updated project snapshot.',
+      },
+      {
+        signature: '@Remote(\'activatePlaybook\') remoteActivatePlaybook(request: { readonly runId: string; readonly playbookId: string }): AutoDevSnapshot',
+        description: 'Activate an applicable Draft Playbook and require Plan re-review.',
+        parameters: [{ name: 'request', description: 'The Run and Draft Playbook identities.' }],
+        returns: 'The updated project snapshot.',
+      },
+      {
+        signature: '@Remote(\'deprecatePlaybook\') remoteDeprecatePlaybook(request: { readonly runId: string; readonly playbookId: string }): AutoDevSnapshot',
+        description: 'Deprecate an applicable Playbook while retaining its history.',
+        parameters: [{ name: 'request', description: 'The Run and Playbook identities.' }],
+        returns: 'The updated project snapshot.',
+      },
+      {
+        signature: '@Remote(\'knowledge\') remoteKnowledge(runId: string): readonly KnowledgeCandidate[]',
+        description: 'List established or candidate Knowledge records in the Run\'s scope.',
+        parameters: [{ name: 'runId', description: 'The Run that supplies the scope.' }],
+        returns: 'Up to twenty Knowledge records.',
+      },
+      {
+        signature: '@Remote(\'knowledgeSearch\') remoteKnowledgeSearch(request: { readonly runId: string; readonly query: string; readonly limit?: number; readonly maxChars?: number }): readonly KnowledgeSearchHit[]',
+        description: 'Search Knowledge with caller-selected, bounded result limits.',
+        parameters: [{ name: 'request', description: 'The Run, query, and optional result limits.' }],
+        returns: 'Matching Knowledge summaries and retrieval metadata.',
+      },
+      {
+        signature: '@Remote(\'knowledgeRegressionCases\') remoteKnowledgeRegressionCases(runId: string): readonly KnowledgeRegressionCase[]',
+        description: 'List the Knowledge regression cases that apply to the Run\'s scope.',
+        parameters: [{ name: 'runId', description: 'The Run that supplies the project scope.' }],
+        returns: 'The current scoped regression cases.',
+      },
+      {
+        signature: '@Remote(\'createKnowledgeRegression\') remoteCreateKnowledgeRegression(request: { readonly runId: string readonly operationId?: string readonly name: string readonly query: string readonly expectedStatements: readonly string[] readonly forbiddenStatements?: readonly string[] }): AutoDevSnapshot',
+        description: 'Create a scoped Knowledge retrieval regression case.',
+        parameters: [{ name: 'request', description: 'The Run, query, and expected or forbidden statements.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'runKnowledgeRegressionSuite\') remoteRunKnowledgeRegressionSuite(runId: string, operationId?: string): AutoDevSnapshot',
+        description: 'Run the current regression suite for the Run\'s Knowledge scope.',
+        parameters: [{ name: 'runId', description: 'The Run that supplies the project scope.' }, { name: 'operationId', description: 'Optional caller identity used to deduplicate Remote retries.' }],
+        returns: 'The updated snapshot with the persisted suite result.',
+      },
+      {
+        signature: '@Remote(\'knowledgeDetail\') remoteKnowledgeDetail(request: { readonly runId: string; readonly knowledgeId: string }): KnowledgeCandidate | undefined',
+        description: 'Read a Knowledge record only when it applies to the Run\'s scope.',
+        parameters: [{ name: 'request', description: 'The Run and Knowledge identifiers.' }],
+        returns: 'The scoped Knowledge record, or `undefined` when absent.',
+      },
+      {
+        signature: '@Remote(\'proposeKnowledgeMerges\') remoteProposeKnowledgeMerges(request: { readonly runId: string readonly limit?: number readonly minSimilarity?: number }): AutoDevSnapshot',
+        description: 'Generate bounded semantic merge proposals for exact-scope Knowledge.',
+        parameters: [{ name: 'request', description: 'Run identifier and optional proposal-generation limits.' }],
+        returns: 'The authoritative snapshot including persisted review proposals.',
+      },
+      {
+        signature: '@Remote(\'acceptKnowledgeMerge\') remoteAcceptKnowledgeMerge(request: { readonly runId: string readonly proposalId: string readonly statement: string readonly content?: string readonly resolution: string }): AutoDevSnapshot',
+        description: 'Accept a Knowledge merge as a new Candidate without changing its inputs.',
+        parameters: [{ name: 'request', description: 'Run, proposal, human-authored merged text, and review rationale.' }],
+        returns: 'The authoritative snapshot including the Candidate and resolved proposal.',
+      },
+      {
+        signature: '@Remote(\'rejectKnowledgeMerge\') remoteRejectKnowledgeMerge(request: { readonly runId: string readonly proposalId: string readonly resolution: string }): AutoDevSnapshot',
+        description: 'Reject a Knowledge merge while retaining the human rationale.',
+        parameters: [{ name: 'request', description: 'Run, proposal, and reason to keep the inputs separate.' }],
+        returns: 'The authoritative snapshot with the rejected proposal.',
+      },
+      {
+        signature: '@Remote(\'resolveUncertainty\') remoteResolveUncertainty(request: { readonly runId: string; readonly uncertaintyId: string; readonly status: \'RESOLVED\' | \'DISMISSED\'; readonly resolution: string }): AutoDevSnapshot',
+        description: 'Resolve or dismiss an uncertainty owned by the Run.',
+        parameters: [{ name: 'request', description: 'The Run, uncertainty, status, and human resolution.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'resolveAssumption\') remoteResolveAssumption(request: { readonly runId: string; readonly assumptionId: string; readonly status: \'CONFIRMED\' | \'INVALIDATED\' | \'UNKNOWN\'; readonly resolution: string; readonly evidenceIds?: readonly string[] }): AutoDevSnapshot',
+        description: 'Resolve an assumption and open a Gate when invalidation needs replanning.',
+        parameters: [{ name: 'request', description: 'The Run, assumption, resolution, and optional Evidence ids.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'compactKnowledge\') remoteCompactKnowledge(runId: string, operationId?: string): AutoDevSnapshot',
+        description: 'Compact Knowledge in the Run\'s exact scope and record the side effect.',
+        parameters: [{ name: 'runId', description: 'The Run that supplies the Knowledge scope.' }, { name: 'operationId', description: 'Optional caller identity used to deduplicate Remote retries.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'restoreKnowledgeCompaction\') remoteRestoreKnowledgeCompaction(request: { readonly runId: string; readonly reportId: string }): AutoDevSnapshot',
+        description: 'Restore a compaction only when its snapshots and versions still match.',
+        parameters: [{ name: 'request', description: 'The Run and compaction report identifiers.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'promoteKnowledge\') remotePromoteKnowledge(request: { readonly runId: string readonly knowledgeId: string readonly evidenceIds: readonly string[] readonly regressionCaseId: string }): AutoDevSnapshot',
+        description: 'Promote a Knowledge candidate after Evidence and regression validation.',
+        parameters: [{ name: 'request', description: 'The Run, candidate, Evidence ids, and passing case id.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'resolveGate\') async remoteResolveGate(request: { readonly runId: string; readonly action: \'retry\' | \'rework\' | \'replan\' | \'abandon\' | \'promote\' | \'cancel\'; readonly sessionId?: string }, signal: AbortSignal): Promise<AutoDevSnapshot>',
+        description: 'Resolve a browser-visible Gate action without accepting arbitrary Agent input. Retry and rework require the DSH Session bound to this repository and use its live parent Agent. Their Run outlives the short Remote admission call.',
+        parameters: [{ name: 'request', description: 'The Run, selected Gate action, and optional DSH Session identity.' }, { name: 'signal', description: 'The Host request cancellation signal for admission.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'promote\') async remotePromote(runId: string, signal: AbortSignal): Promise<AutoDevSnapshot>',
+        description: 'Promote after the browser has presented the Candidate and Evidence.',
+        parameters: [{ name: 'runId', description: 'The Run whose verified Candidate is being promoted.' }, { name: 'signal', description: 'The Host request cancellation signal.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'cancel\') async remoteCancel(runId: string): Promise<AutoDevSnapshot>',
+        description: 'Cancel a Run while retaining its Worktree and artifacts.',
+        parameters: [{ name: 'runId', description: 'The Run to cancel.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: '@Remote(\'candidateDiff\') async remoteCandidateDiff(runId: string, signal: AbortSignal): Promise<ArtifactContent | undefined>',
+        description: 'Return a bounded, path-free Candidate Diff view to the Web Client.',
+        parameters: [{ name: 'runId', description: 'The Run whose Candidate diff is requested.' }, { name: 'signal', description: 'The Host request cancellation signal.' }],
+        returns: 'The bounded diff artifact, or `undefined` when no Candidate exists.',
+      },
+      {
+        signature: '@Remote(\'candidateRevisionDiff\') async remoteCandidateRevisionDiff(runId: string, candidateId: string, signal: AbortSignal): Promise<ArtifactContent | undefined>',
+        description: 'Return a bounded Diff for a specific Candidate that belongs to the Run.',
+        parameters: [{ name: 'runId', description: 'The owning Run identifier.' }, { name: 'candidateId', description: 'Candidate revision identifier from this Run\'s history.' }, { name: 'signal', description: 'The Host request cancellation signal.' }],
+        returns: 'The bounded Diff artifact, or `undefined` when the Candidate has no Diff.',
+      },
+      {
+        signature: 'async create(request: CreateRunRequest, signal?: AbortSignal): Promise<AutoDevSnapshot>',
+        description: 'Inspect a clean repository and persist a Run, Plan, and baseline Evidence.',
+        parameters: [{ name: 'request', description: 'The repository, requested change, acceptance criteria, and optional scope.' }, { name: 'signal', description: 'Optional cancellation signal for repository inspection.' }],
+        returns: 'The new Run\'s authoritative snapshot.',
+      },
+      {
+        signature: 'snapshot(runId: string): AutoDevSnapshot',
+        description: 'Read the current authoritative snapshot for a Run.',
+        parameters: [{ name: 'runId', description: 'The Run to inspect.' }],
+        returns: 'The persisted Run state and related records.',
+      },
+      {
+        signature: 'listProviders(): readonly ProviderInfo[]',
+        description: 'List Providers visible to the current Host runtime.',
+        parameters: [],
+        returns: 'Registered custom Providers and Harness subagents.',
+      },
+      {
+        signature: 'registerProvider(provider: Parameters<ProviderRouter[\'register\']>[0]): () => void',
+        description: 'Register a Provider for dynamic route selection.',
+        parameters: [{ name: 'provider', description: 'The adapter identity, capabilities, and run function.' }],
+        returns: 'A disposer that unregisters this Provider.',
+      },
+      {
+        signature: 'registerRouteCandidate(routeName: string, candidate: RouteCandidate): () => void',
+        description: 'Add a candidate backed by a Provider already loaded by Harness, such as an ACP subagent.',
+        parameters: [{ name: 'routeName', description: 'Existing AutoDev route to extend.' }, { name: 'candidate', description: 'Provider kind, registered name, and route-specific capabilities.' }],
+        returns: 'A disposer that removes only this candidate.',
+      },
+      {
+        signature: 'registerRoutedProvider( routeName: string, provider: CustomProvider, candidate: Pick<RouteCandidate, \'enabled\' | \'model\' | \'traits\'> = {}, ): () => void',
+        description: 'Register a custom Provider and append it to an existing route as one reversible operation. If candidate registration fails, the Provider registration is rolled back. The returned disposer removes the candidate and Provider together, which lets an extension Bundle unload without leaving a dangling route entry or an unreachable Provider.',
+        parameters: [{ name: 'routeName', description: 'Existing AutoDev route to extend.' }, { name: 'provider', description: 'Custom Provider adapter to register.' }, { name: 'candidate', description: 'Route-specific model, enabled state, or capability declaration.' }],
+        returns: 'A disposer that unregisters both parts of the extension.',
+      },
+      {
+        signature: 'async run(runId: string, parentAgent?: unknown, signal?: AbortSignal): Promise<AutoDevSnapshot>',
+        description: 'Execute the current Plan in a dedicated Worktree and retain all Evidence.',
+        parameters: [{ name: 'runId', description: 'The Run to execute or resume.' }, { name: 'parentAgent', description: 'Optional Harness Agent context passed to subagent adapters.' }, { name: 'signal', description: 'Optional caller cancellation signal.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: 'async resolveGate( runId: string, action: \'retry\' | \'rework\' | \'replan\' | \'abandon\' | \'promote\' | \'cancel\', parentAgent?: unknown, signal?: AbortSignal, actor: AutoDevAuditActor = { kind: \'autodev-runtime\', source: \'runtime-policy\' }, ): Promise<AutoDevSnapshot>',
+        description: 'Apply an action that the current Human Gate explicitly permits.',
+        parameters: [{ name: 'runId', description: 'The Run with the open Gate.' }, { name: 'action', description: 'The selected Gate action.' }, { name: 'parentAgent', description: 'Optional Harness Agent context used for resumed execution.' }, { name: 'signal', description: 'Optional caller cancellation signal.' }, { name: 'actor', description: 'Host-derived initiating source; it is never read from request data.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: 'async promote( runId: string, signal?: AbortSignal, actor: AutoDevAuditActor = { kind: \'autodev-runtime\', source: \'runtime-policy\' }, ): Promise<AutoDevSnapshot>',
+        description: 'Revalidate and explicitly apply the verified Candidate to its original checkout.',
+        parameters: [{ name: 'runId', description: 'The Run whose Candidate is being promoted.' }, { name: 'signal', description: 'Optional cancellation signal for promotion checks.' }, { name: 'actor', description: 'Host-derived initiating source; it is never read from request data.' }],
+        returns: 'The updated authoritative Run snapshot.',
+      },
+      {
+        signature: 'async cancel(runId: string): Promise<AutoDevSnapshot>',
+        description: 'Abort active Run work while retaining Worktree and evidence; uncertain effects remain non-promotable.',
+        parameters: [{ name: 'runId', description: 'Exact Run to cancel.' }],
+        returns: 'The persisted state after the cancellation request.',
+      },
+      {
+        signature: 'async dispose(): Promise<void>',
+        description: 'Abort active Runs and await settlement before the owning plugin closes SQLite.',
+        parameters: [],
+        returns: 'A promise that resolves after all active Run operations settle.',
+      },
+    ],
+  },
+  {
     key: 'browserUse',
     summary: 'Owns one optional provider registration in the shared browser-use service.',
     description: 'Owns one optional provider registration in the shared browser-use service.',
@@ -4232,6 +4646,22 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface AccountWallet {\n    readonly currency: \'CNY\' | \'USD\';\n    readonly balance: string;\n}',
   },
   {
+    name: 'ActionIntent',
+    declaration: 'export interface ActionIntent {\n    readonly id: string;\n    readonly runId: string;\n    readonly nodeId?: string;\n    readonly kind: ActionIntentKind;\n    readonly target: string;\n    readonly risk: ActionRisk;\n    readonly idempotencyKey: string;\n    readonly preconditions: readonly string[];\n    readonly authorization?: string;\n    readonly authorizedBy?: AutoDevAuditActor;\n    readonly status: ActionIntentStatus;\n    readonly createdAt: string;\n    readonly updatedAt: string;\n}',
+  },
+  {
+    name: 'ActionIntentKind',
+    declaration: 'export type ActionIntentKind = \'agent-workspace\' | \'command\' | \'git-promotion\' | \'memory-write\' | \'knowledge-promotion\';',
+  },
+  {
+    name: 'ActionIntentStatus',
+    declaration: 'export type ActionIntentStatus = \'PLANNED\' | \'AUTHORIZED\' | \'EXECUTING\' | \'COMMITTED\' | \'FAILED\' | \'UNKNOWN\' | \'COMPENSATED\' | \'REJECTED\';',
+  },
+  {
+    name: 'ActionRisk',
+    declaration: 'export type ActionRisk = \'low\' | \'medium\' | \'high\' | \'destructive\';',
+  },
+  {
     name: 'AdapterRegistrationHandle',
     declaration: 'export interface AdapterRegistrationHandle {\n    (): void;\n    replace(providers: string[]): void;\n}',
   },
@@ -4244,8 +4674,28 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface Agent {\n    readonly id: SessionId;\n}',
   },
   {
+    name: 'AgentAdapter',
+    declaration: 'export interface AgentAdapter {\n    readonly name: string;\n    readonly kind: string;\n    readonly capabilities: AgentCapabilities;\n    readonly isAvailable?: () => boolean | Promise<boolean>;\n    execute(request: AgentAdapterRequest): Promise<AgentResult>;\n}',
+  },
+  {
+    name: 'AgentAdapterInfo',
+    declaration: 'export interface AgentAdapterInfo {\n    readonly name: string;\n    readonly kind: string;\n    readonly capabilities: AgentCapabilities;\n    readonly available: boolean;\n}',
+  },
+  {
+    name: 'AgentAdapterRequest',
+    declaration: 'export interface AgentAdapterRequest {\n    readonly task: AgentTask;\n    readonly context: AutoDevAgentContext;\n    readonly signal: AbortSignal;\n    readonly parentAgent?: unknown;\n    readonly emitSignal: (signal: AgentSignalInput) => void;\n}',
+  },
+  {
     name: 'AgentCancelCause',
     declaration: 'export type AgentCancelCause = {\n    readonly kind: \'user\';\n} | {\n    readonly kind: \'parent\';\n} | {\n    readonly kind: \'hook\';\n    readonly reason: string;\n} | {\n    readonly kind: \'disposed\';\n};',
+  },
+  {
+    name: 'AgentCapabilities',
+    declaration: 'export interface AgentCapabilities {\n    readonly traits: readonly string[];\n    readonly taskKinds: readonly AgentTaskKind[];\n    readonly workspace: \'isolated\' | \'shared\' | \'external\';\n    readonly supportsCancellation: boolean;\n    readonly supportsSignals: boolean;\n}',
+  },
+  {
+    name: 'AgentExecutionResult',
+    declaration: 'export type AgentExecutionResult = Omit<AgentResult, \'signals\'> & {\n    readonly signals: readonly AgentSignalEnvelope[];\n};',
   },
   {
     name: 'AgentFactory',
@@ -4276,8 +4726,16 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface AgentPresetRow {\n    readonly id: string;\n    readonly isDefault: boolean;\n    readonly name?: string;\n    readonly description?: string;\n    readonly broken?: string;\n}',
   },
   {
+    name: 'AgentProtocol',
+    declaration: 'export class AgentProtocol {\n    register(adapter: AgentAdapter): () => void;\n    get(name: string): AgentAdapter | undefined;\n    list(): readonly AgentAdapterInfo[];\n    async execute(adapterOrName: AgentAdapter | string, request: Omit<AgentAdapterRequest, \'emitSignal\'>): Promise<AgentExecutionResult>;\n}',
+  },
+  {
     name: 'AgentResolver',
     declaration: 'export type AgentResolver = (sessionId: SessionId) => Promise<Agent>;',
+  },
+  {
+    name: 'AgentResult',
+    declaration: 'export interface AgentResult {\n    readonly provider: string;\n    readonly status: \'completed\' | \'error\' | \'aborted\' | \'unknown\';\n    readonly output: string;\n    readonly diagnostic?: string;\n    readonly artifactIds?: readonly string[];\n    readonly signals?: readonly AgentSignalInput[];\n}',
   },
   {
     name: 'AgentSetup',
@@ -4288,8 +4746,28 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface AgentSetupCommit {\n    commit(): void;\n}',
   },
   {
+    name: 'AgentSignal',
+    declaration: 'export type AgentSignal = {\n    readonly type: \'PlanProposed\';\n    readonly summary?: string;\n    readonly planFingerprint?: string;\n} | {\n    readonly type: \'AssumptionRaised\';\n    readonly statement?: string;\n    readonly confidence?: number;\n    readonly conflictsWith?: readonly string[];\n} | {\n    readonly type: \'SemanticUncertainty\';\n    readonly subject?: string;\n    readonly reason?: string;\n    readonly alternatives?: readonly string[];\n    readonly assumptionIds?: readonly string[];\n} | {\n    readonly type: \'PlaybookMatched\';\n    readonly playbookId?: string;\n    readonly playbookVersion?: string;\n    readonly fit?: \'MATCH\' | \'PARTIAL\';\n} | {\n    readonly type: \'PlaybookMismatch\';\n    readonly playbookId?: string;\n    readonly reason?: string;\n} | {\n    readonly type: \'EvidenceProduced\';\n    readonly evidenceId?: string;\n    readonly summary?: string;\n    readonly status?: \'PASS\' | \'FAIL\' | \'WARN\' | \'UNKNOWN\';\n} | {\n    readonly type: \'ExecutionBlocked\';\n    readonly reason?: string;\n    readonly recoverable?: boolean;\n} | {\n    readonly type: \'ReplanRequested\';\n    readonly reason?: string;\n} | {\n    readonly type: \'HumanDecisionRequired\';\n    readonly question?: string;\n    readonly options?: readonly string[];\n    readonly risk?: string;\n} | {\n    readonly type: \'KnowledgeCandidate\';\n    readonly subject?: string;\n    readonly summary?: string;\n    readonly confidence?: number;\n} | {\n    readonly type: \'VerificationFailed\';\n    readonly checkId?: string;\n    reado /* …truncated — full shape in source */',
+  },
+  {
+    name: 'AgentSignalEnvelope',
+    declaration: 'export interface AgentSignalEnvelope {\n    readonly protocolVersion: typeof AGENT_PROTOCOL_VERSION;\n    readonly id: string;\n    readonly taskId: string;\n    readonly runId: string;\n    readonly planVersionId: string;\n    readonly nodeId: string;\n    readonly attempt: number;\n    readonly provider: string;\n    readonly sequence: number;\n    readonly signal: AgentSignal;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'AgentSignalInput',
+    declaration: 'export type AgentSignalInput = AgentSignal | {\n    readonly type: string;\n    readonly [key: string]: unknown;\n};',
+  },
+  {
     name: 'AgentStatus',
     declaration: 'export type AgentStatus = \'idle\' | \'running\';',
+  },
+  {
+    name: 'AgentTask',
+    declaration: 'export interface AgentTask {\n    readonly protocolVersion: typeof AGENT_PROTOCOL_VERSION;\n    readonly id: string;\n    readonly runId: string;\n    readonly planVersionId: string;\n    readonly nodeId: string;\n    readonly attempt: number;\n    readonly kind: AgentTaskKind;\n    readonly instruction: string;\n    readonly acceptanceCriteria: readonly string[];\n    readonly workspacePath: string;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'AgentTaskKind',
+    declaration: 'export type AgentTaskKind = \'implement\' | \'review\' | \'analyze\' | \'verify\' | \'custom\';',
   },
   {
     name: 'ApiKeyRecord',
@@ -4322,6 +4800,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'ArchiveSessionOptions',
     declaration: 'export interface ArchiveSessionOptions {\n    readonly stopActivity?: boolean;\n}',
+  },
+  {
+    name: 'ArtifactContent',
+    declaration: 'export interface ArtifactContent {\n    readonly id: string;\n    readonly runId: string;\n    readonly kind: string;\n    readonly sha256: string;\n    readonly bytes: number;\n    readonly content: string;\n    readonly truncated: boolean;\n}',
+  },
+  {
+    name: 'ArtifactRef',
+    declaration: 'export interface ArtifactRef {\n    readonly id: string;\n    readonly runId: string;\n    readonly kind: string;\n    readonly path: string;\n    readonly sha256: string;\n    readonly bytes: number;\n    readonly createdAt: string;\n}',
   },
   {
     name: 'AskUserQuestionAnswer',
@@ -4378,6 +4864,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'AssistantStreamRecord',
     declaration: 'export type AssistantStreamRecord = {\n    readonly type: \'text-chunks\';\n    readonly time0: number;\n    readonly index: number;\n    readonly dt: readonly number[];\n    readonly texts: readonly string[];\n} | {\n    readonly type: \'reasoning-chunks\';\n    readonly time0: number;\n    readonly index: number;\n    readonly dt: readonly number[];\n    readonly texts: readonly string[];\n} | {\n    readonly type: \'tool-call-chunks\';\n    readonly time0: number;\n    readonly index: number;\n    readonly dt: readonly number[];\n    readonly id: ToolCallId;\n    readonly name?: string;\n    readonly args: readonly string[];\n} | {\n    readonly type: \'chunk\';\n    readonly time: number;\n    readonly chunk: StreamChunk;\n};',
+  },
+  {
+    name: 'Assumption',
+    declaration: 'export interface Assumption {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly runId?: string;\n    readonly planId?: string;\n    readonly statement: string;\n    readonly rationale?: string;\n    readonly status: AssumptionStatus;\n    readonly confidence: number;\n    readonly sourceRefs: readonly SourceReference[];\n    readonly evidenceIds: readonly string[];\n    readonly resolution?: string;\n    readonly createdAt: string;\n    readonly updatedAt: string;\n}',
+  },
+  {
+    name: 'AssumptionStatus',
+    declaration: 'export type AssumptionStatus = \'PROPOSED\' | \'CONFIRMED\' | \'INVALIDATED\' | \'UNKNOWN\';',
   },
   {
     name: 'AttachmentAdmissionPart',
@@ -4444,6 +4938,42 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type AuthorizationStatus = \'authorized\' | \'cancelled\';',
   },
   {
+    name: 'AutoDevAgentContext',
+    declaration: 'export interface AutoDevAgentContext {\n    readonly runId: string;\n    readonly projectKey: string;\n    readonly repoRoot: string;\n    readonly baseCommit: string;\n    readonly workspacePath: string;\n    readonly planVersionId: string;\n    readonly nodeId: string;\n    readonly attempt: number;\n    readonly evidenceIds: readonly string[];\n    readonly memoryRefs?: readonly string[];\n    readonly conceptRefs?: readonly string[];\n    readonly assumptionRefs?: readonly string[];\n    readonly uncertaintyRefs?: readonly string[];\n    readonly playbookRefs?: readonly string[];\n    readonly knowledgeRefs?: readonly string[];\n    readonly memoryCards?: readonly string[];\n    readonly conceptCards?: readonly string[];\n    readonly assumptionCards?: readonly string[];\n    readonly uncertaintyCards?: readonly string[];\n    readonly playbookCards?: readonly string[];\n    readonly knowledgeCards?: readonly string[];\n    readonly contextBudget?: {\n        readonly maxChars: number;\n        readonly usedChars: number;\n    };\n}',
+  },
+  {
+    name: 'AutoDevAuditActor',
+    declaration: 'export type AutoDevAuditActor = {\n    readonly kind: \'dsh-operator\';\n    readonly source: \'dsh-gateway\';\n    readonly connectionPeerId?: string;\n} | {\n    readonly kind: \'autodev-runtime\';\n    readonly source: \'runtime-policy\';\n} | {\n    readonly kind: \'host-internal\';\n    readonly source: \'direct-host-call\';\n};',
+  },
+  {
+    name: 'AutoDevBackupFile',
+    declaration: 'export interface AutoDevBackupFile {\n    readonly path: string;\n    readonly bytes: number;\n    readonly sha256: string;\n}',
+  },
+  {
+    name: 'AutoDevBackupManifest',
+    declaration: 'export interface AutoDevBackupManifest {\n    readonly formatVersion: 1;\n    readonly databaseSchemaVersion: number;\n    readonly createdAt: string;\n    readonly included: readonly [\n        \'sqlite\',\n        \'run-artifacts\'\n    ];\n    readonly excluded: readonly [\n        \'git-worktrees\'\n    ];\n    readonly files: readonly AutoDevBackupFile[];\n}',
+  },
+  {
+    name: 'AutoDevCleanupJobView',
+    declaration: 'export interface AutoDevCleanupJobView {\n    readonly id: string;\n    readonly status: RetentionCleanupJobStatus;\n    readonly minAgeDays: number;\n    readonly snapshotFingerprint: string;\n    readonly createdAt: string;\n    readonly updatedAt: string;\n    readonly confirmationPhrase: string;\n    readonly items: readonly Omit<RetentionCleanupJobItem, \'leaseOwner\' | \'leaseExpiresAt\'>[];\n    readonly requestedBy?: AutoDevAuditActor;\n    readonly confirmedBy?: AutoDevAuditActor;\n    readonly cancelledBy?: AutoDevAuditActor;\n    readonly events?: readonly RetentionCleanupJobEvent[];\n}',
+  },
+  {
+    name: 'AutoDevConfig',
+    declaration: 'export interface AutoDevConfig {\n    readonly dataRoot?: string;\n    readonly worktreeRoot?: string;\n    readonly maxAttempts?: number;\n    readonly commandTimeoutMs?: number;\n    readonly buildTimeoutMs?: number;\n    readonly testTimeoutMs?: number;\n    readonly qualityMinScore?: number;\n    readonly jev?: JevConfig;\n    readonly routes?: Readonly<Record<string, RoutePolicy>>;\n    readonly maven?: MavenConfig;\n    readonly buildDriver?: BuildDriverId | \'auto\';\n    readonly drivers?: Partial<Record<BuildDriverId, DriverCommandSettings>>;\n}',
+  },
+  {
+    name: 'AutoDevRetentionPreview',
+    declaration: 'export interface AutoDevRetentionPreview {\n    readonly generatedAt: string;\n    readonly minAgeDays: number;\n    readonly snapshotFingerprint: string;\n    readonly eligibleWorktrees: readonly RetentionWorktreeItem[];\n    readonly blockedWorktrees: readonly RetentionBlockedWorktree[];\n}',
+  },
+  {
+    name: 'AutoDevSnapshot',
+    declaration: 'export interface AutoDevSnapshot {\n    readonly run: Run;\n    readonly plan?: PlanVersion;\n    readonly nodes: readonly NodeExecution[];\n    readonly candidate?: CandidateRevision;\n    readonly candidateHistory?: readonly CandidateRevisionSummary[];\n    readonly evidence: readonly Evidence[];\n    readonly decisions: readonly (RouteDecision | JevDecision)[];\n    readonly gates: readonly HumanGate[];\n    readonly signals: readonly import(\'./protocol.ts\').AgentSignalEnvelope[];\n    readonly verificationChecks: readonly VerificationCheck[];\n    readonly verificationResults: readonly VerificationResult[];\n    readonly verifications: readonly VerificationReport[];\n    readonly memories: readonly ProjectMemory[];\n    readonly assumptions: readonly Assumption[];\n    readonly uncertainties: readonly SemanticUncertainty[];\n    readonly concepts: readonly BusinessConcept[];\n    readonly conceptObservations: readonly ConceptObservation[];\n    readonly playbooks: readonly Playbook[];\n    readonly playbookFits: readonly PlaybookFit[];\n    readonly knowledge: readonly KnowledgeCandidate[];\n    readonly knowledgeMergeProposals: readonly KnowledgeMergeProposal[];\n    readonly compactions: readonly KnowledgeCompactionReport[];\n    readonly regressionCases: readonly KnowledgeRegressionCase[];\n    readonly regressionResults: readonly KnowledgeRegressionResult[];\n    readonly regressionSuites: readonly KnowledgeRegressionSuite[];\n    readonly actionIntents: readonly ActionIntent[];\n    readonly s /* …truncated — full shape in source */',
+  },
+  {
+    name: 'AutoDevStore',
+    declaration: 'export class AutoDevStore {\n    readonly root: string;\n    readonly dbPath: string;\n    readonly artifactsRoot: string;\n    constructor(root: string = defaultDataRoot());\n    close(): void;\n    createDatabaseSnapshot(destinationPath: string): void;\n    createRun(run: Run): void;\n    getRun(id: string): Run | undefined;\n    listRuns(): Run[];\n    updateRun(id: string, update: (run: Run) => Run): Run;\n    approvePlan(runId: string, planId: string, evidenceId: string, actor: AutoDevAuditActor): Run;\n    createPlan(plan: PlanVersion): void;\n    updatePlanStatus(id: string, status: Extract<PlanVersion[\'status\'], \'SUPERSEDED\' | \'CANCELLED\'>): PlanVersion;\n    getPlan(id: string): PlanVersion | undefined;\n    listPlans(runId: string): PlanVersion[];\n    createNode(node: NodeExecution): void;\n    saveNode(node: NodeExecution): void;\n    getNode(id: string): NodeExecution | undefined;\n    listNodes(runId: string): NodeExecution[];\n    saveCandidate(candidate: CandidateRevision): void;\n    getCandidate(id: string): CandidateRevision | undefined;\n    getArtifact(id: string): ArtifactRef | undefined;\n    listCandidates(runId: string): CandidateRevision[];\n    getRetentionCleanupJob(id: string): RetentionCleanupJobRecord | undefined;\n    listRetentionCleanupJobs(): RetentionCleanupJobRecord[];\n    createRetentionCleanupJob(job: RetentionCleanupJobRecord): {\n        readonly job: RetentionCleanupJobRecord;\n        readonly created: boolean;\n    };\n    confirmRetentionCleanupJob(id: string, /* …truncated — full shape in source */',
+  },
+  {
     name: 'BackendRegistry',
     declaration: 'export class BackendRegistry {\n    register(name: string, backend: StorageBackend): () => void;\n    get(name: string): StorageBackend;\n    names(): string[];\n}',
   },
@@ -4472,12 +5002,32 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type BrowserUseProviderName = Branded<\'BrowserUseProviderName\'>;',
   },
   {
+    name: 'BuildDriverId',
+    declaration: 'export type BuildDriverId = \'maven\' | \'gradle\' | \'node\' | \'pytest\';',
+  },
+  {
     name: 'BundleInfo',
     declaration: 'export interface BundleInfo {\n    name: string;\n    version?: string;\n    meta?: PluginLocalizedMeta;\n    description?: string;\n    enabled: boolean;\n    installed: boolean;\n    optional: boolean;\n    removable: boolean;\n    readOnlyReason?: ReadOnlyReason;\n    error?: ManagementError;\n    rows: BundleRowInfo[];\n    overrides: string[];\n}',
   },
   {
     name: 'BundleRowInfo',
     declaration: 'export interface BundleRowInfo {\n    rowId: string;\n    moduleName: string;\n    meta?: PluginLocalizedMeta;\n    entryId?: PluginEntryId;\n}',
+  },
+  {
+    name: 'BusinessConcept',
+    declaration: 'export interface BusinessConcept {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly key: string;\n    readonly name: string;\n    readonly definition: string;\n    readonly target: string;\n    readonly effect: string;\n    readonly evidenceCriteria: readonly string[];\n    readonly status: ConceptStatus;\n    readonly confidence: number;\n    readonly version: number;\n    readonly sourceRefs: readonly SourceReference[];\n    readonly evidenceIds: readonly string[];\n    readonly relatedConceptIds: readonly string[];\n    readonly createdAt: string;\n    readonly updatedAt: string;\n}',
+  },
+  {
+    name: 'BusinessConceptService',
+    declaration: 'export class BusinessConceptService {\n    constructor(readonly store: AutoDevStore);\n    observe(input: ObserveConceptInput): {\n        readonly concept: BusinessConcept;\n        readonly observation: ConceptObservation;\n    };\n    correct(input: ObserveConceptInput & {\n        readonly resolution?: string;\n    }): BusinessConcept;\n    setStatus(id: string, status: ConceptStatus, evidenceIds: readonly string[] = []): BusinessConcept;\n    search(scope: ScopeQuery, query: string): readonly BusinessConcept[];\n    unresolvedAmbiguities(scope: ScopeQuery, query: string): readonly ConceptObservation[];\n    match(scope: ScopeRef, input: ConceptMatchInput): readonly BusinessConcept[];\n}',
+  },
+  {
+    name: 'CandidateRevision',
+    declaration: 'export interface CandidateRevision {\n    readonly id: string;\n    readonly runId: string;\n    readonly planId: string;\n    readonly worktreePath: string;\n    readonly baseCommit: string;\n    readonly gitTreeHash: string;\n    readonly attempt?: number;\n    readonly diffArtifactId?: string;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'CandidateRevisionSummary',
+    declaration: 'export interface CandidateRevisionSummary {\n    readonly id: string;\n    readonly runId: string;\n    readonly planId: string;\n    readonly baseCommit: string;\n    readonly gitTreeHash: string;\n    readonly attempt?: number;\n    readonly diffAvailable: boolean;\n    readonly createdAt: string;\n}',
   },
   {
     name: 'ChangeResult',
@@ -4508,6 +5058,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface CommandExecution {\n    readonly commandId: CommandId;\n    readonly result: CommandResult;\n}',
   },
   {
+    name: 'CommandExecutor',
+    declaration: 'export interface CommandExecutor {\n    run(argv: readonly string[], cwd: string, options?: {\n        readonly signal?: AbortSignal | undefined;\n        readonly timeoutMs?: number;\n        readonly env?: Readonly<Record<string, string | undefined>>;\n        readonly maxOutputBytes?: number;\n    }): Promise<CommandResult>;\n}',
+  },
+  {
     name: 'CommandFileReceiptResolver',
     declaration: 'export type CommandFileReceiptResolver = (agent: Agent, receiptId: string) => FileAttachmentRef | undefined;',
   },
@@ -4522,10 +5076,6 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'CommandInvocation',
     declaration: 'export interface CommandInvocation {\n    readonly commandId: CommandId;\n    readonly agent: Agent;\n    readonly rawInput: string;\n    readonly attachments: readonly (ImageBlock | FileBlock)[];\n    readonly signal: AbortSignal;\n}',
-  },
-  {
-    name: 'CommandResult',
-    declaration: 'export type CommandResult = {\n    readonly kind: \'success\';\n    readonly text?: string;\n    readonly sourceEventSeq?: SessionSeq;\n} | {\n    readonly kind: \'error\';\n    readonly text: string;\n};',
   },
   {
     name: 'CommandSubmitAttachment',
@@ -4554,6 +5104,18 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'ComputerUseProviderName',
     declaration: 'export type ComputerUseProviderName = Branded<\'ComputerUseProviderName\'>;',
+  },
+  {
+    name: 'ConceptMatchInput',
+    declaration: 'export interface ConceptMatchInput {\n    readonly target: string;\n    readonly effect: string;\n    readonly evidence?: readonly string[];\n}',
+  },
+  {
+    name: 'ConceptObservation',
+    declaration: 'export interface ConceptObservation {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly runId?: string;\n    readonly planId?: string;\n    readonly conceptId?: string;\n    readonly name?: string;\n    readonly definition?: string;\n    readonly key: string;\n    readonly target: string;\n    readonly effect: string;\n    readonly relationship?: \'SUPPORTING\' | \'AMBIGUOUS\' | \'HUMAN_CORRECTION\';\n    readonly version?: number;\n    readonly evidenceSummary: string;\n    readonly evidenceIds: readonly string[];\n    readonly sourceRefs: readonly SourceReference[];\n    readonly confidence: number;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'ConceptStatus',
+    declaration: 'export type ConceptStatus = \'CANDIDATE\' | \'ESTABLISHED\' | \'DEPRECATED\';',
   },
   {
     name: 'ConfinedArgv',
@@ -4728,6 +5290,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface CreateGoalResult {\n    readonly ref: GoalRef;\n}',
   },
   {
+    name: 'CreateRunRequest',
+    declaration: 'export interface CreateRunRequest {\n    readonly repoPath: string;\n    readonly request: string;\n    readonly acceptanceCriteria?: readonly string[];\n    readonly goalId?: string;\n    readonly buildDriver?: BuildDriverId;\n    readonly scope?: Omit<ScopeRef, \'projectKey\'>;\n}',
+  },
+  {
     name: 'CreateSessionOptions',
     declaration: 'export interface CreateSessionOptions {\n    readonly seed?: readonly SessionEvent[];\n    readonly inheritedEventCount?: SessionLogOffset;\n    readonly meta?: {\n        readonly cwd?: string;\n        readonly parentSession?: SessionId;\n        readonly createdAt?: number;\n        readonly isSeeded?: boolean;\n        readonly origin?: \'subagent\';\n        readonly delegationDepth?: number;\n        readonly agentPreset?: string;\n    };\n}',
   },
@@ -4758,6 +5324,38 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'CredentialRef',
     declaration: 'export type CredentialRef = Branded<\'CredentialRef\'>;',
+  },
+  {
+    name: 'CustomProvider',
+    declaration: 'export interface CustomProvider {\n    readonly name: string;\n    readonly kind: \'command\' | \'model\' | \'subagent\';\n    readonly traits: readonly string[];\n    readonly workspaceCwd?: boolean;\n    readonly isAvailable?: () => boolean | Promise<boolean>;\n    run(request: ProviderRunRequest): Promise<ProviderRunResult>;\n}',
+  },
+  {
+    name: 'DecisionAnswer',
+    declaration: 'export interface DecisionAnswer {\n    readonly questionId: string;\n    readonly kind: \'choice\' | \'score\' | \'noul\';\n    readonly value?: string | number | boolean | null;\n    readonly probability?: number;\n}',
+  },
+  {
+    name: 'DecisionCoordinator',
+    declaration: 'export class DecisionCoordinator {\n    readonly config: Required<Pick<JevConfig, \'mode\' | \'questionSetVersion\'>> & JevConfig;\n    constructor(options: DecisionCoordinatorOptions = {});\n    async evaluate(purpose: DecisionPurpose, state: unknown, signal: AbortSignal, customQuestions?: readonly JevQuestion[]): Promise<DecisionResult & {\n        readonly stateHash: string;\n        readonly questionSetVersion: string;\n        readonly degraded?: string;\n    }>;\n}',
+  },
+  {
+    name: 'DecisionCoordinatorOptions',
+    declaration: 'export interface DecisionCoordinatorOptions {\n    readonly config?: JevConfig;\n    readonly provider?: DecisionProvider;\n    readonly staticProvider?: DecisionProvider;\n}',
+  },
+  {
+    name: 'DecisionProvider',
+    declaration: 'export interface DecisionProvider {\n    evaluate(request: DecisionRequest): Promise<DecisionResult>;\n}',
+  },
+  {
+    name: 'DecisionPurpose',
+    declaration: 'export type DecisionPurpose = \'agent-route\' | \'failure-action\' | \'quality\' | \'completion\';',
+  },
+  {
+    name: 'DecisionRequest',
+    declaration: 'export interface DecisionRequest {\n    readonly purpose: DecisionPurpose;\n    readonly state: unknown;\n    readonly questions: readonly JevQuestion[];\n    readonly signal: AbortSignal;\n}',
+  },
+  {
+    name: 'DecisionResult',
+    declaration: 'export interface DecisionResult {\n    readonly source: \'jev\' | \'static\' | \'fallback\';\n    readonly modelVersion: string;\n    readonly answers: readonly DecisionAnswer[];\n    readonly raw?: unknown;\n    readonly usage?: {\n        readonly inputTokens?: number;\n        readonly outputTokens?: number;\n    };\n}',
   },
   {
     name: 'DeepSeekLlmApiExtensionMap',
@@ -4860,6 +5458,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface DomainTableSpec<K extends string = string, V = unknown> {\n    readonly valueSchema: ZodType<V>;\n    readonly __key?: K;\n}',
   },
   {
+    name: 'DriverCommandSettings',
+    declaration: 'export interface DriverCommandSettings {\n    readonly executable?: string;\n    readonly buildArgs?: readonly string[];\n    readonly testArgs?: readonly string[];\n}',
+  },
+  {
     name: 'DshEnvironment',
     declaration: 'export type DshEnvironment = Readonly<Record<DshEnvironmentKey, string>>;',
   },
@@ -4900,8 +5502,28 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface EncodedImageAttachment {\n    mediaType: ImageMediaType;\n    data: string;\n    name?: string;\n}',
   },
   {
+    name: 'EnvironmentFingerprint',
+    declaration: 'export interface EnvironmentFingerprint {\n    readonly platform: string;\n    readonly arch: string;\n    readonly node: string;\n    readonly buildDriverId?: BuildDriverId;\n    readonly git?: string;\n    readonly java?: string;\n    readonly maven?: string;\n    readonly buildArgs?: readonly string[];\n    readonly testArgs?: readonly string[];\n    readonly harness?: string;\n    readonly capturedAt: string;\n}',
+  },
+  {
     name: 'EpochHeader',
     declaration: 'export interface EpochHeader {\n    config: LlmCallConfig;\n    adapterDefaults?: LlmCallConfigAdapterDefaults;\n    tools?: ToolSchema[];\n    system?: never;\n}',
+  },
+  {
+    name: 'Evidence',
+    declaration: 'export interface Evidence {\n    readonly id: string;\n    readonly runId: string;\n    readonly candidateId?: string | undefined;\n    readonly gitTreeHash?: string;\n    readonly type: EvidenceType;\n    readonly status: EvidenceStatus;\n    readonly summary: string;\n    readonly artifactId?: string;\n    readonly environment?: EnvironmentFingerprint;\n    readonly planId?: string;\n    readonly nodeId?: string;\n    readonly attempt?: number;\n    readonly source?: \'runtime\' | \'command\' | \'agent\' | \'human\' | \'jev\' | \'system\';\n    readonly actor?: AutoDevAuditActor;\n    readonly parentEvidenceIds?: readonly string[];\n    readonly expiresAt?: string;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'EvidenceStatus',
+    declaration: 'export type EvidenceStatus = \'PASS\' | \'FAIL\' | \'WARN\' | \'UNKNOWN\';',
+  },
+  {
+    name: 'EvidenceType',
+    declaration: 'export type EvidenceType = \'REPOSITORY_BASELINE\' | \'PLAN_APPROVAL\' | \'AGENT_OUTPUT\' | \'AGENT_CONTEXT\' | \'DIFF\' | \'BUILD\' | \'TEST\' | \'REVIEW\' | \'JEV_DECISION\' | \'DRIFT\' | \'PROMOTION\' | \'ENVIRONMENT\' | \'VERIFICATION\' | \'SIDE_EFFECT\' | \'MEMORY\' | \'CONCEPT\' | \'PLAYBOOK\' | \'KNOWLEDGE\';',
+  },
+  {
+    name: 'ExecuteRetentionCleanupRequest',
+    declaration: 'export interface ExecuteRetentionCleanupRequest {\n    readonly jobId: string;\n    readonly snapshotFingerprint: string;\n    readonly confirmationPhrase: string;\n}',
   },
   {
     name: 'FeedbackCategory',
@@ -5004,6 +5626,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface GenericResultView {\n    card: \'generic\';\n    title?: string;\n    content?: ContentBlock[];\n}',
   },
   {
+    name: 'GitManager',
+    declaration: 'export class GitManager {\n    constructor(private readonly commands: CommandExecutor, private readonly worktreeRoot: string);\n    async inspect(repoPath: string, signal?: AbortSignal): Promise<RepositoryBaseline>;\n    async createWorktree(runId: string, baseline: RepositoryBaseline, signal?: AbortSignal, attempt: number = 1): Promise<string>;\n    async treeHash(worktreePath: string, signal?: AbortSignal): Promise<string>;\n    async status(worktreePath: string, signal?: AbortSignal): Promise<readonly string[]>;\n    async diff(worktreePath: string, baseCommit: string, signal?: AbortSignal): Promise<string>;\n    async currentHead(repoRoot: string, signal?: AbortSignal): Promise<string>;\n    async promote(repoRoot: string, baseCommit: string, patchPath: string, expectedTreeHash: string, signal?: AbortSignal): Promise<GitPromotionOutcome>;\n    async removeWorktree(worktreePath: string, repoRoot: string, signal?: AbortSignal): Promise<void>;\n    async removeWorktreeSafely(worktreePath: string, repoRoot: string): Promise<void>;\n    async isRegisteredWorktree(worktreePath: string, repoRoot: string): Promise<boolean>;\n}',
+  },
+  {
+    name: 'GitPromotionOutcome',
+    declaration: 'export type GitPromotionOutcome = \'applied\' | \'already-applied\';',
+  },
+  {
     name: 'GoalActivation',
     declaration: 'export type GoalActivation = \'armed\' | \'disarmed\';',
   },
@@ -5054,6 +5684,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'HostConnectionRpc',
     declaration: 'export interface HostConnectionRpc {\n    handle(channel: string, handler: ConnectionRpcHandler): () => Promise<void>;\n    intercept(channel: \'/api\', matches: ConnectionRpcEndpointMatcher, handler: ConnectionRpcHandler): () => Promise<void>;\n}',
+  },
+  {
+    name: 'HumanGate',
+    declaration: 'export interface HumanGate {\n    readonly id: string;\n    readonly runId: string;\n    readonly reason: string;\n    readonly options: readonly (\'retry\' | \'rework\' | \'replan\' | \'abandon\' | \'promote\' | \'cancel\')[];\n    readonly status: \'OPEN\' | \'RESOLVED\';\n    readonly selected?: string;\n    readonly createdAt: string;\n    readonly resolvedAt?: string;\n    readonly resolvedBy?: AutoDevAuditActor;\n}',
   },
   {
     name: 'ImageAttachmentLimits',
@@ -5138,6 +5772,22 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'InvokeRemoteRequest',
     declaration: 'export interface InvokeRemoteRequest {\n    readonly namespace: string;\n    readonly method: string;\n    readonly args: Readonly<Record<string, unknown>>;\n    readonly uplink?: AsyncIterable<unknown>;\n    readonly peer?: PeerScope;\n    readonly signal?: AbortSignal;\n}',
+  },
+  {
+    name: 'JevConfig',
+    declaration: 'export interface JevConfig {\n    readonly mode?: JevMode;\n    readonly endpoint?: string;\n    readonly model?: string;\n    readonly apiKeyEnv?: string;\n    readonly timeoutMs?: number;\n    readonly retryCount?: number;\n    readonly minConfidence?: Partial<Record<DecisionPurpose, number>>;\n    readonly questionSetVersion?: string;\n    readonly sendPaths?: boolean;\n}',
+  },
+  {
+    name: 'JevDecision',
+    declaration: 'export interface JevDecision {\n    readonly id: string;\n    readonly runId?: string;\n    readonly purpose: DecisionPurpose;\n    readonly stateHash: string;\n    readonly questionSetVersion: string;\n    readonly source: \'jev\' | \'static\' | \'fallback\';\n    readonly modelVersion: string;\n    readonly answer: readonly DecisionAnswer[];\n    readonly probability?: number;\n    readonly confidence?: number;\n    readonly policyOutcome: \'accepted\' | \'rejected\' | \'degraded\' | \'paused\';\n    readonly reason: string;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'JevMode',
+    declaration: 'export type JevMode = \'required\' | \'advisory\' | \'off\';',
+  },
+  {
+    name: 'JevQuestion',
+    declaration: 'export interface JevQuestion {\n    readonly id: string;\n    readonly type: \'choice\' | \'score\' | \'noul\';\n    readonly text: string;\n    readonly choices?: readonly string[];\n    readonly min?: number;\n    readonly max?: number;\n}',
   },
   {
     name: 'JobAppendOptions',
@@ -5262,6 +5912,66 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'JsonValue',
     declaration: 'export type JsonValue = null | boolean | number | string | JsonValue[] | {\n    [key: string]: JsonValue;\n};',
+  },
+  {
+    name: 'KnowledgeCandidate',
+    declaration: 'export interface KnowledgeCandidate {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly kind: KnowledgeKind;\n    readonly statement: string;\n    readonly content: string;\n    readonly status: KnowledgeStatus;\n    readonly confidence: number;\n    readonly version: number;\n    readonly sourceRefs: readonly SourceReference[];\n    readonly evidenceIds: readonly string[];\n    readonly relatedMemoryIds: readonly string[];\n    readonly usageCount?: number;\n    readonly successCount?: number;\n    readonly failureCount?: number;\n    readonly lastUsedAt?: string;\n    readonly lastValidatedAt?: string;\n    readonly expiresAt?: string;\n    readonly supersededBy?: string;\n    readonly createdAt: string;\n    readonly updatedAt: string;\n}',
+  },
+  {
+    name: 'KnowledgeCandidateInput',
+    declaration: 'export interface KnowledgeCandidateInput {\n    readonly scope: ScopeRef;\n    readonly kind: KnowledgeKind;\n    readonly statement: string;\n    readonly content?: string;\n    readonly confidence?: number;\n    readonly sourceRefs?: readonly SourceReference[];\n    readonly evidenceIds?: readonly string[];\n    readonly relatedMemoryIds?: readonly string[];\n    readonly expiresAt?: string;\n}',
+  },
+  {
+    name: 'KnowledgeCompactionReport',
+    declaration: 'export interface KnowledgeCompactionReport {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly inputIds: readonly string[];\n    readonly outputIds: readonly string[];\n    readonly actions: readonly {\n        readonly kind: \'retained\' | \'deduplicated\' | \'merged\' | \'deprecated\' | \'archived\';\n        readonly inputIds: readonly string[];\n        readonly outputId?: string;\n        readonly reason: string;\n    }[];\n    readonly snapshots: readonly KnowledgeCandidate[];\n    readonly resultingVersions: readonly {\n        readonly id: string;\n        readonly version: number;\n    }[];\n    readonly restoredAt?: string;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'KnowledgeKind',
+    declaration: 'export type KnowledgeKind = \'fact\' | \'rule\' | \'experience\' | \'hypothesis\';',
+  },
+  {
+    name: 'KnowledgeMergeApprovalInput',
+    declaration: 'export interface KnowledgeMergeApprovalInput {\n    readonly statement: string;\n    readonly content?: string;\n    readonly resolution: string;\n}',
+  },
+  {
+    name: 'KnowledgeMergeOptions',
+    declaration: 'export interface KnowledgeMergeOptions {\n    readonly limit?: number;\n    readonly minSimilarity?: number;\n}',
+  },
+  {
+    name: 'KnowledgeMergeProposal',
+    declaration: 'export interface KnowledgeMergeProposal {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly kind: KnowledgeKind;\n    readonly inputIds: readonly string[];\n    readonly inputVersions: readonly {\n        readonly id: string;\n        readonly version: number;\n    }[];\n    readonly similarity: number;\n    readonly sharedTerms: readonly string[];\n    readonly reason: string;\n    readonly status: \'PROPOSED\' | \'ACCEPTED\' | \'REJECTED\' | \'STALE\';\n    readonly outputKnowledgeId?: string;\n    readonly resolution?: string;\n    readonly createdAt: string;\n    readonly resolvedAt?: string;\n}',
+  },
+  {
+    name: 'KnowledgeRegressionCase',
+    declaration: 'export interface KnowledgeRegressionCase {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly name: string;\n    readonly input: string;\n    readonly expectedStatements: readonly string[];\n    readonly forbiddenStatements?: readonly string[];\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'KnowledgeRegressionResult',
+    declaration: 'export interface KnowledgeRegressionResult {\n    readonly id: string;\n    readonly caseId: string;\n    readonly status: \'PASS\' | \'FAIL\' | \'UNKNOWN\';\n    readonly matched: readonly string[];\n    readonly missing: readonly string[];\n    readonly unexpected: readonly string[];\n    readonly testedKnowledgeVersions?: readonly {\n        readonly id: string;\n        readonly version: number;\n    }[];\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'KnowledgeRegressionSuite',
+    declaration: 'export interface KnowledgeRegressionSuite {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly status: \'PASS\' | \'FAIL\' | \'UNKNOWN\';\n    readonly caseIds: readonly string[];\n    readonly resultIds: readonly string[];\n    readonly testedKnowledgeVersions: readonly {\n        readonly id: string;\n        readonly version: number;\n    }[];\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'KnowledgeSearchHit',
+    declaration: 'export interface KnowledgeSearchHit {\n    readonly knowledge: KnowledgeCandidate;\n    readonly temperature: KnowledgeTemperature;\n    readonly score: number;\n    readonly reason: string;\n}',
+  },
+  {
+    name: 'KnowledgeSearchOptions',
+    declaration: 'export interface KnowledgeSearchOptions {\n    readonly limit?: number;\n    readonly maxChars?: number;\n    readonly now?: string;\n}',
+  },
+  {
+    name: 'KnowledgeService',
+    declaration: 'export class KnowledgeService {\n    constructor(readonly store: AutoDevStore);\n    candidate(input: KnowledgeCandidateInput): KnowledgeCandidate;\n    get(id: string): KnowledgeCandidate | undefined;\n    list(scope: ScopeQuery, includeDeprecated: boolean = false): readonly KnowledgeCandidate[];\n    search(scope: ScopeQuery, query: string, options: KnowledgeSearchOptions = {}): readonly KnowledgeCandidate[];\n    searchHits(scope: ScopeQuery, query: string, options: KnowledgeSearchOptions = {}): readonly KnowledgeSearchHit[];\n    proposeMerges(scopeInput: ScopeRef, options: KnowledgeMergeOptions = {}): readonly KnowledgeMergeProposal[];\n    acceptMergeProposal(proposalId: string, input: KnowledgeMergeApprovalInput): KnowledgeCandidate;\n    rejectMergeProposal(proposalId: string, resolution: string): KnowledgeMergeProposal;\n    promote(id: string, evidenceIds: readonly string[], regressionCaseId: string): KnowledgeCandidate;\n    recordUse(id: string, outcome: \'success\' | \'failure\'): KnowledgeCandidate;\n    validate(id: string, evidenceIds: readonly string[]): KnowledgeCandidate;\n    expire(scopeInput: ScopeRef, now: string = new Date().toISOString()): readonly string[];\n    deprecate(id: string, reason?: string): KnowledgeCandidate;\n    compact(scopeInput: ScopeRef): KnowledgeCompactionReport;\n    restoreCompaction(reportId: string): readonly string[];\n    createRegressionCase(input: {\n        readonly scope: ScopeRef;\n        readonly name: string;\n        readonly query: string /* …truncated — full shape in source */',
+  },
+  {
+    name: 'KnowledgeStatus',
+    declaration: 'export type KnowledgeStatus = \'OBSERVED\' | \'CANDIDATE\' | \'ESTABLISHED\' | \'DEPRECATED\';',
+  },
+  {
+    name: 'KnowledgeTemperature',
+    declaration: 'export type KnowledgeTemperature = \'hot\' | \'warm\' | \'cold\';',
   },
   {
     name: 'KvFacet',
@@ -5400,12 +6110,28 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ManualCompactAgentContext extends CompactionAgentContext {\n    runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>;\n}',
   },
   {
+    name: 'MavenConfig',
+    declaration: 'export interface MavenConfig {\n    readonly buildArgs?: readonly string[];\n    readonly testArgs?: readonly string[];\n    readonly executable?: string;\n}',
+  },
+  {
     name: 'McpResourceProvider',
     declaration: 'export interface McpResourceProvider {\n    request(request: McpResourceRequest, exec: ToolExecution): Promise<JsonValue>;\n}',
   },
   {
     name: 'McpResourceRequest',
     declaration: 'export type McpResourceRequest = {\n    method: \'resources/list\' | \'resources/templates/list\';\n    cursor?: string;\n} | {\n    method: \'resources/read\';\n    uri: string;\n};',
+  },
+  {
+    name: 'MemoryKind',
+    declaration: 'export type MemoryKind = \'fact\' | \'rule\' | \'experience\' | \'hypothesis\';',
+  },
+  {
+    name: 'MemorySearchHit',
+    declaration: 'export interface MemorySearchHit {\n    readonly memory: ProjectMemory;\n    readonly score: number;\n    readonly reason: string;\n}',
+  },
+  {
+    name: 'MemorySearchOptions',
+    declaration: 'export interface MemorySearchOptions {\n    readonly limit?: number;\n    readonly maxChars?: number;\n    readonly includeDeprecated?: boolean;\n}',
   },
   {
     name: 'Message',
@@ -5540,8 +6266,20 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface NativeFileApplication {\n    readonly id: string;\n    readonly name: string;\n    readonly default: boolean;\n    readonly icon: string | null;\n}',
   },
   {
+    name: 'NodeExecution',
+    declaration: 'export interface NodeExecution {\n    readonly id: string;\n    readonly runId: string;\n    readonly planId: string;\n    readonly nodeId: string;\n    readonly attempt: number;\n    readonly status: NodeStatus;\n    readonly provider?: string;\n    readonly inputTree?: string;\n    readonly outputTree?: string;\n    readonly startedAt?: string;\n    readonly endedAt?: string;\n    readonly error?: string;\n}',
+  },
+  {
+    name: 'NodeStatus',
+    declaration: 'export type NodeStatus = \'PENDING\' | \'READY\' | \'RUNNING\' | \'COMPLETED\' | \'FAILED\' | \'UNKNOWN\' | \'BLOCKED\';',
+  },
+  {
     name: 'ObjectJsonSchema',
     declaration: 'export type ObjectJsonSchema = JsonSchemaNode & {\n    type: \'object\';\n};',
+  },
+  {
+    name: 'ObserveConceptInput',
+    declaration: 'export interface ObserveConceptInput {\n    readonly scope: ScopeRef;\n    readonly runId?: string;\n    readonly planId?: string;\n    readonly key: string;\n    readonly name: string;\n    readonly definition: string;\n    readonly target: string;\n    readonly effect: string;\n    readonly evidenceCriteria?: readonly string[];\n    readonly evidenceSummary: string;\n    readonly evidenceIds?: readonly string[];\n    readonly sourceRefs?: readonly SourceReference[];\n    readonly confidence?: number;\n}',
   },
   {
     name: 'OfficeExtension',
@@ -5600,8 +6338,48 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface PermissionCatalog {\n    options: PresetOption[];\n    defaultOptions: PresetOption[];\n    defaultPreset: string;\n}',
   },
   {
+    name: 'PlanActionInput',
+    declaration: 'export interface PlanActionInput {\n    readonly runId: string;\n    readonly nodeId?: string;\n    readonly kind: ActionIntentKind;\n    readonly target: string;\n    readonly risk: ActionRisk;\n    readonly preconditions?: readonly string[];\n    readonly idempotencyKey?: string;\n}',
+  },
+  {
+    name: 'PlanNode',
+    declaration: 'export interface PlanNode {\n    readonly id: string;\n    readonly kind: \'implement\' | \'build\' | \'test\' | \'review\';\n    readonly description: string;\n    readonly dependencies: readonly string[];\n    readonly expectedOutputs: readonly string[];\n    readonly routeName?: string;\n}',
+  },
+  {
+    name: 'PlanVersion',
+    declaration: 'export interface PlanVersion {\n    readonly schemaVersion: typeof AUTODEV_SCHEMA_VERSION;\n    readonly id: string;\n    readonly runId: string;\n    readonly version: number;\n    readonly parentId?: string;\n    readonly status: \'ACTIVE\' | \'SUPERSEDED\' | \'CANCELLED\';\n    readonly fingerprint: string;\n    readonly nodes: readonly PlanNode[];\n    readonly buildDriverId?: BuildDriverId;\n    readonly createdAt: string;\n    readonly assumptionIds?: readonly string[];\n    readonly conceptIds?: readonly string[];\n    readonly playbookIds?: readonly string[];\n}',
+  },
+  {
     name: 'PlatformSession',
     declaration: 'export interface PlatformSession {\n    readonly origin: string;\n    readonly token: string;\n    readonly embeddedPageDist?: string;\n    readonly requestHeaders?: Readonly<Record<string, string>>;\n}',
+  },
+  {
+    name: 'Playbook',
+    declaration: 'export interface Playbook {\n    readonly id: string;\n    readonly scope?: ScopeRef;\n    readonly key: string;\n    readonly name: string;\n    readonly purpose: string;\n    readonly targets: readonly string[];\n    readonly effects: readonly string[];\n    readonly conceptKeys: readonly string[];\n    readonly exclusions?: readonly string[];\n    readonly steps: readonly string[];\n    readonly requiredEvidence: readonly EvidenceType[];\n    readonly status: PlaybookStatus;\n    readonly confidence: number;\n    readonly version: number;\n    readonly sourceRefs: readonly SourceReference[];\n    readonly supportingEvidenceIds?: readonly string[];\n    readonly parentId?: string;\n    readonly supersededBy?: string;\n    readonly createdFromRunIds?: readonly string[];\n    readonly createdAt: string;\n    readonly updatedAt: string;\n}',
+  },
+  {
+    name: 'PlaybookFit',
+    declaration: 'export interface PlaybookFit {\n    readonly id: string;\n    readonly runId?: string;\n    readonly playbookId: string;\n    readonly playbookVersion: number;\n    readonly outcome: PlaybookFitOutcome;\n    readonly matched: readonly string[];\n    readonly missing: readonly string[];\n    readonly reasons: readonly string[];\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'PlaybookFitInput',
+    declaration: 'export interface PlaybookFitInput {\n    readonly scope?: ScopeRef;\n    readonly target: string;\n    readonly effect: string;\n    readonly conceptKeys?: readonly string[];\n    readonly evidenceTypes?: readonly EvidenceType[];\n}',
+  },
+  {
+    name: 'PlaybookFitOutcome',
+    declaration: 'export type PlaybookFitOutcome = \'MATCH\' | \'PARTIAL\' | \'MISMATCH\';',
+  },
+  {
+    name: 'PlaybookInput',
+    declaration: 'export interface PlaybookInput {\n    readonly scope?: ScopeRef;\n    readonly key: string;\n    readonly name: string;\n    readonly purpose: string;\n    readonly targets: readonly string[];\n    readonly effects: readonly string[];\n    readonly conceptKeys?: readonly string[];\n    readonly exclusions?: readonly string[];\n    readonly steps: readonly string[];\n    readonly requiredEvidence?: readonly EvidenceType[];\n    readonly confidence?: number;\n    readonly sourceRefs?: readonly SourceReference[];\n    readonly supportingEvidenceIds?: readonly string[];\n    readonly createdFromRunIds?: readonly string[];\n}',
+  },
+  {
+    name: 'PlaybookService',
+    declaration: 'export class PlaybookService {\n    constructor(readonly store: AutoDevStore);\n    create(input: PlaybookInput): Playbook;\n    activate(id: string): Playbook;\n    deprecate(id: string): Playbook;\n    revise(id: string, input: PlaybookInput): Playbook;\n    list(scope?: ScopeQuery): readonly Playbook[];\n    search(scope: ScopeQuery | undefined, query: string): readonly Playbook[];\n    fit(playbookId: string, input: PlaybookFitInput, runId?: string): PlaybookFit;\n    require(id: string): Playbook;\n}',
+  },
+  {
+    name: 'PlaybookStatus',
+    declaration: 'export type PlaybookStatus = \'DRAFT\' | \'ACTIVE\' | \'DEPRECATED\';',
   },
   {
     name: 'PluginChange',
@@ -5684,6 +6462,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface PreparedReferencedMessage {\n    content: ContentBlock[];\n    additionalContext?: UserMessage;\n}',
   },
   {
+    name: 'PrepareRetentionCleanupRequest',
+    declaration: 'export interface PrepareRetentionCleanupRequest {\n    readonly requestId: string;\n    readonly minAgeDays: number;\n    readonly snapshotFingerprint: string;\n    readonly retentionIds: readonly string[];\n}',
+  },
+  {
     name: 'PrepareSessionOptions',
     declaration: 'export type PrepareSessionOptions = (CreateSessionOptions & {\n    readonly eventState?: undefined;\n}) | RestoredSessionOptions;',
   },
@@ -5740,6 +6522,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ProjectionSnapshot {\n    asOfSeq: SessionSeqCursor;\n    values: Partial<SessionProjectionMap>;\n}',
   },
   {
+    name: 'ProjectMemory',
+    declaration: 'export interface ProjectMemory {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly kind: MemoryKind;\n    readonly title: string;\n    readonly content: string;\n    readonly tags: readonly string[];\n    readonly status: KnowledgeStatus;\n    readonly confidence: number;\n    readonly sourceRefs: readonly SourceReference[];\n    readonly evidenceIds: readonly string[];\n    readonly version: number;\n    readonly supersedesId?: string;\n    readonly expiresAt?: string;\n    readonly createdAt: string;\n    readonly updatedAt: string;\n}',
+  },
+  {
+    name: 'ProjectMemoryService',
+    declaration: 'export class ProjectMemoryService {\n    constructor(readonly store: AutoDevStore);\n    remember(input: RememberInput): ProjectMemory;\n    get(id: string): ProjectMemory | undefined;\n    list(scope: ScopeQuery, includeDeprecated: boolean = false): readonly ProjectMemory[];\n    search(scope: ScopeQuery, query: string, options: MemorySearchOptions = {}): readonly MemorySearchHit[];\n    setStatus(id: string, status: Exclude<KnowledgeStatus, \'CANDIDATE\'>, evidenceIds: readonly string[] = []): ProjectMemory;\n    compact(scope: ScopeRef): {\n        readonly reportId: string;\n        readonly deprecatedIds: readonly string[];\n    };\n}',
+  },
+  {
     name: 'PromptAssembly',
     declaration: 'export interface PromptAssembly {\n    sections: AssembledSection[];\n    contexts: AssembledContext[];\n    tools: ToolSchema[];\n    variables: Record<string, string | undefined>;\n}',
   },
@@ -5764,8 +6554,32 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type PromptSectionOrderName = keyof typeof SECTION_ORDERS;',
   },
   {
+    name: 'ProviderCatalog',
+    declaration: 'export interface ProviderCatalog {\n    readonly providers: readonly ProviderInfo[];\n    readonly routes: Readonly<Record<string, RoutePolicy>>;\n}',
+  },
+  {
+    name: 'ProviderInfo',
+    declaration: 'export interface ProviderInfo {\n    readonly name: string;\n    readonly kind: RouteKind;\n    readonly available: boolean;\n    readonly traits: readonly string[];\n}',
+  },
+  {
     name: 'ProviderRequestId',
     declaration: 'export type ProviderRequestId = Branded<\'ProviderRequestId\'>;',
+  },
+  {
+    name: 'ProviderRouter',
+    declaration: 'export class ProviderRouter {\n    constructor(options: ProviderRouterOptions);\n    register(provider: CustomProvider): () => void;\n    list(): readonly ProviderInfo[];\n    policy(name: string): RoutePolicy | undefined;\n    registerRoute(name: string, policy: RoutePolicy): () => void;\n    registerCandidate(routeName: string, candidate: RouteCandidate): () => void;\n    listRoutes(): Readonly<Record<string, RoutePolicy>>;\n    async select(runId: string | undefined, nodeId: string | undefined, purpose: \'agent-route\', routeName: string, state: unknown, requiredTraits: readonly string[] = [], signal: AbortSignal): Promise<RouteSelection>;\n    async invoke(candidate: RouteCandidate, request: Omit<ProviderRunRequest, \'provider\' | \'model\'>): Promise<ProviderRunResult>;\n    agentAdapter(candidate: RouteCandidate): AgentAdapter;\n}',
+  },
+  {
+    name: 'ProviderRouterOptions',
+    declaration: 'export interface ProviderRouterOptions {\n    readonly routes?: Readonly<Record<string, RoutePolicy>> | undefined;\n    readonly subagents?: SubagentRuntime | undefined;\n    readonly decisions: DecisionCoordinator;\n    readonly store?: AutoDevStore | undefined;\n}',
+  },
+  {
+    name: 'ProviderRunRequest',
+    declaration: 'export interface ProviderRunRequest {\n    readonly provider: string;\n    readonly model?: string;\n    readonly request: string;\n    readonly acceptanceCriteria: readonly string[];\n    readonly cwd: string;\n    readonly signal: AbortSignal;\n    readonly parentAgent?: unknown;\n    readonly task?: AgentTask;\n    readonly context?: AutoDevAgentContext;\n    readonly emitSignal?: (signal: AgentSignalInput) => void;\n}',
+  },
+  {
+    name: 'ProviderRunResult',
+    declaration: 'export interface ProviderRunResult {\n    readonly provider: string;\n    readonly status: \'completed\' | \'error\' | \'aborted\';\n    readonly output: string;\n    readonly diagnostic?: string;\n    readonly signals?: readonly AgentSignalInput[];\n}',
   },
   {
     name: 'PrunedEntry',
@@ -5820,6 +6634,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type QueueAction = {\n    readonly kind: \'edit\';\n    readonly content: readonly TextBlock[];\n} | {\n    readonly kind: \'remove\';\n} | {\n    readonly kind: \'steer\';\n};',
   },
   {
+    name: 'RaiseAssumptionInput',
+    declaration: 'export interface RaiseAssumptionInput {\n    readonly scope: ScopeRef;\n    readonly runId?: string;\n    readonly planId?: string;\n    readonly statement: string;\n    readonly rationale?: string;\n    readonly confidence?: number;\n    readonly sourceRefs?: readonly SourceReference[];\n    readonly evidenceIds?: readonly string[];\n}',
+  },
+  {
+    name: 'RaiseUncertaintyInput',
+    declaration: 'export interface RaiseUncertaintyInput {\n    readonly scope: ScopeRef;\n    readonly runId: string;\n    readonly planId?: string;\n    readonly subject: string;\n    readonly reason: string;\n    readonly alternatives?: readonly string[];\n    readonly severity?: SemanticUncertainty[\'severity\'];\n    readonly sourceRefs?: readonly SourceReference[];\n}',
+  },
+  {
     name: 'ReadFileLine',
     declaration: 'export interface ReadFileLine {\n    number: number;\n    text: string;\n}',
   },
@@ -5852,6 +6674,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface Reload {\n    filename: string;\n    runtime?: Plugin.Runtime | undefined;\n}',
   },
   {
+    name: 'RememberInput',
+    declaration: 'export interface RememberInput {\n    readonly scope: ScopeRef;\n    readonly kind: MemoryKind;\n    readonly title: string;\n    readonly content: string;\n    readonly tags?: readonly string[];\n    readonly status?: KnowledgeStatus;\n    readonly confidence?: number;\n    readonly sourceRefs?: readonly SourceReference[];\n    readonly evidenceIds?: readonly string[];\n    readonly supersedesId?: string;\n    readonly expiresAt?: string;\n}',
+  },
+  {
     name: 'RemoteError',
     declaration: 'export class RemoteError<Code extends RemoteErrorCode = RemoteErrorCode> extends Error {\n    readonly isDSHRemoteError: true;\n    constructor(readonly code: Code, message: string, readonly details: RemoteErrorDetailsMap[Code], options?: ErrorOptions);\n}',
   },
@@ -5874,6 +6700,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'ReplayEnvelope',
     declaration: 'export interface ReplayEnvelope {\n    response: unknown;\n    blocks?: readonly unknown[];\n}',
+  },
+  {
+    name: 'RepositoryBaseline',
+    declaration: 'export interface RepositoryBaseline {\n    readonly repoPath: string;\n    readonly repoRoot: string;\n    readonly baseCommit: string;\n    readonly clean: boolean;\n    readonly status: readonly string[];\n    readonly capturedAt: string;\n}',
   },
   {
     name: 'RequestContext',
@@ -5908,6 +6738,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ResolvedAlwaysRetryPolicy extends ResolvedRetryBackoff {\n    readonly mode: \'always\';\n}',
   },
   {
+    name: 'ResolvedAutoDevConfig',
+    declaration: 'export interface ResolvedAutoDevConfig {\n    readonly dataRoot: string;\n    readonly worktreeRoot: string;\n    readonly maxAttempts: number;\n    readonly commandTimeoutMs: number;\n    readonly buildTimeoutMs: number;\n    readonly testTimeoutMs: number;\n    readonly qualityMinScore: number;\n    readonly jev: NonNullable<AutoDevConfig[\'jev\']>;\n    readonly routes: AutoDevConfig[\'routes\'];\n    readonly buildDriver: NonNullable<AutoDevConfig[\'buildDriver\']>;\n    readonly drivers: NonNullable<AutoDevConfig[\'drivers\']>;\n    readonly maven: Required<Pick<NonNullable<AutoDevConfig[\'maven\']>, \'buildArgs\' | \'testArgs\'>> & NonNullable<AutoDevConfig[\'maven\']>;\n}',
+  },
+  {
     name: 'ResolvedCredential',
     declaration: 'export interface ResolvedCredential {\n    value: string;\n    source: string;\n}',
   },
@@ -5936,12 +6770,76 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ResumeAgentOptions {\n    readonly resumeSessionId: SessionId;\n    readonly parentAgent?: Agent;\n    readonly agentOptions?: AgentOptions;\n    readonly signal?: AbortSignal;\n    readonly setup?: AgentSetup;\n}',
   },
   {
+    name: 'RetentionBlockedWorktree',
+    declaration: 'export interface RetentionBlockedWorktree extends RetentionWorktreeItem {\n    readonly reasons: readonly RetentionBlockReason[];\n}',
+  },
+  {
+    name: 'RetentionBlockReason',
+    declaration: 'export type RetentionBlockReason = \'active-runtime-operation\' | \'run-not-terminal\' | \'open-gate\' | \'unsettled-side-effect\' | \'invalid-run-timestamp\' | \'retention-period-not-elapsed\' | \'future-run-timestamp\' | \'worktree-outside-managed-root\' | \'worktree-is-symlink\' | \'worktree-is-not-directory\' | \'worktree-unavailable\' | \'worktree-path-shared\';',
+  },
+  {
+    name: 'RetentionCleanupFailureCode',
+    declaration: 'export type RetentionCleanupFailureCode = \'preview-stale\' | \'run-state-changed\' | \'target-not-eligible\' | \'path-unsafe\' | \'git-registration-mismatch\' | \'worktree-dirty\' | \'git-remove-failed\' | \'interrupted\' | \'lease-busy\';',
+  },
+  {
+    name: 'RetentionCleanupItemStatus',
+    declaration: 'export type RetentionCleanupItemStatus = \'PENDING\' | \'EXECUTING\' | \'REMOVED\' | \'FAILED\' | \'BLOCKED\' | \'UNKNOWN\';',
+  },
+  {
+    name: 'RetentionCleanupJobEvent',
+    declaration: 'export interface RetentionCleanupJobEvent {\n    readonly at: string;\n    readonly type: \'prepared\' | \'confirmed\' | \'item-started\' | \'item-removed\' | \'item-failed\' | \'cancelled\';\n    readonly retentionId?: string;\n    readonly sourcePeerId?: string;\n    readonly actor?: AutoDevAuditActor;\n    readonly failureCode?: RetentionCleanupFailureCode;\n}',
+  },
+  {
+    name: 'RetentionCleanupJobItem',
+    declaration: 'export interface RetentionCleanupJobItem {\n    readonly retentionId: string;\n    readonly runId: string;\n    readonly attempt: number;\n    readonly status: RetentionCleanupItemStatus;\n    readonly failureCode?: RetentionCleanupFailureCode;\n    readonly leaseOwner?: string;\n    readonly leaseExpiresAt?: string;\n}',
+  },
+  {
+    name: 'RetentionCleanupJobRecord',
+    declaration: 'export interface RetentionCleanupJobRecord {\n    readonly id: string;\n    readonly status: RetentionCleanupJobStatus;\n    readonly minAgeDays: number;\n    readonly snapshotFingerprint: string;\n    readonly createdAt: string;\n    readonly updatedAt: string;\n    readonly items: readonly RetentionCleanupJobItem[];\n    readonly events: readonly RetentionCleanupJobEvent[];\n    readonly requestedFromPeerId?: string;\n    readonly requestedBy?: AutoDevAuditActor;\n    readonly confirmedFromPeerId?: string;\n    readonly confirmedBy?: AutoDevAuditActor;\n    readonly confirmedAt?: string;\n    readonly cancelledBy?: AutoDevAuditActor;\n}',
+  },
+  {
+    name: 'RetentionCleanupJobStatus',
+    declaration: 'export type RetentionCleanupJobStatus = \'AWAITING_CONFIRMATION\' | \'EXECUTING\' | \'COMPLETED\' | \'NEEDS_ATTENTION\' | \'CANCELLED\';',
+  },
+  {
+    name: 'RetentionWorktreeItem',
+    declaration: 'export interface RetentionWorktreeItem {\n    readonly retentionId: string;\n    readonly runId: string;\n    readonly attempt: number;\n    readonly ageDays: number;\n}',
+  },
+  {
+    name: 'RouteCandidate',
+    declaration: 'export interface RouteCandidate {\n    readonly kind: RouteKind;\n    readonly provider: string;\n    readonly model?: string;\n    readonly enabled?: boolean;\n    readonly traits?: readonly string[];\n}',
+  },
+  {
+    name: 'RouteDecision',
+    declaration: 'export interface RouteDecision {\n    readonly id: string;\n    readonly runId?: string;\n    readonly nodeId?: string;\n    readonly policyVersion: string;\n    readonly purpose: DecisionPurpose;\n    readonly candidates: readonly RouteCandidate[];\n    readonly eligible: readonly RouteCandidate[];\n    readonly selected?: RouteCandidate;\n    readonly confidence?: number;\n    readonly reason: string;\n    readonly rejections: readonly {\n        provider: string;\n        reason: string;\n    }[];\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'RouteKind',
+    declaration: 'export type RouteKind = \'subagent\' | \'command\' | \'model\';',
+  },
+  {
+    name: 'RoutePolicy',
+    declaration: 'export interface RoutePolicy {\n    readonly candidates: readonly RouteCandidate[];\n    readonly requiredTaskTraits?: readonly string[];\n    readonly minConfidence?: number;\n}',
+  },
+  {
+    name: 'RouteSelection',
+    declaration: 'export interface RouteSelection {\n    readonly candidate?: RouteCandidate;\n    readonly decision: RouteDecision;\n}',
+  },
+  {
     name: 'RpcId',
     declaration: 'export type RpcId = Branded<\'rpc-id\'>;',
   },
   {
+    name: 'Run',
+    declaration: 'export interface Run {\n    readonly schemaVersion: typeof AUTODEV_SCHEMA_VERSION;\n    readonly id: string;\n    readonly repoPath: string;\n    readonly request: string;\n    readonly acceptanceCriteria: readonly string[];\n    readonly status: RunStatus;\n    readonly baseCommit: string;\n    readonly repoRoot: string;\n    readonly projectKey?: string;\n    readonly scope?: ScopeRef;\n    readonly goalId?: string;\n    readonly worktreePath?: string | undefined;\n    readonly activePlanId?: string | undefined;\n    readonly approvedPlanId?: string;\n    readonly approvedPlanFingerprint?: string;\n    readonly planApprovedAt?: string;\n    readonly approvedBy?: AutoDevAuditActor;\n    readonly candidateId?: string | undefined;\n    readonly lastError?: string | undefined;\n    readonly currentGateId?: string | undefined;\n    readonly attempt: number;\n    readonly createdAt: string;\n    readonly updatedAt: string;\n    readonly assumptionIds?: readonly string[];\n    readonly conceptIds?: readonly string[];\n    readonly playbookIds?: readonly string[];\n}',
+  },
+  {
     name: 'RunnerFailureRule',
     declaration: 'export interface RunnerFailureRule {\n    allowedExitCodes?: readonly number[];\n    fatalSignatures: readonly string[];\n    informationalLines?: readonly string[];\n}',
+  },
+  {
+    name: 'RunStatus',
+    declaration: 'export type RunStatus = \'DRAFT\' | \'READY\' | \'EXECUTING\' | \'BUILDING\' | \'TESTING\' | \'VERIFY\' | \'PROMOTING\' | \'PROMOTED\' | \'PAUSED\' | \'NEEDS_INTERVENTION\' | \'FAILED\' | \'CANCELLED\' | \'ABANDONED\' | \'REWORK_REQUESTED\';',
   },
   {
     name: 'SandboxEnforcement',
@@ -5996,6 +6894,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type ScopeKey = object;',
   },
   {
+    name: 'ScopeQuery',
+    declaration: 'export type ScopeQuery = string | ScopeRef;',
+  },
+  {
+    name: 'ScopeRef',
+    declaration: 'export interface ScopeRef {\n    readonly projectKey: string;\n    readonly module?: string;\n    readonly branch?: string;\n    readonly language?: string;\n    readonly projectVersion?: string;\n    readonly schemaVersion?: string;\n    readonly techStackVersion?: string;\n}',
+  },
+  {
     name: 'SearchFileMatches',
     declaration: 'export interface SearchFileMatches {\n    path: string;\n    matches: SearchLineMatch[];\n}',
   },
@@ -6014,6 +6920,18 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SearchResultView',
     declaration: 'export type SearchResultView = SearchMatchesResultView | SearchPathsResultView;',
+  },
+  {
+    name: 'SemanticService',
+    declaration: 'export class SemanticService {\n    constructor(readonly store: AutoDevStore);\n    raiseAssumption(input: RaiseAssumptionInput): Assumption;\n    resolveAssumption(id: string, status: Exclude<AssumptionStatus, \'PROPOSED\'>, resolution: string, evidenceIds: readonly string[] = []): Assumption;\n    reconcileAssumptionEvidence(runId: string): readonly Assumption[];\n    raiseUncertainty(input: RaiseUncertaintyInput): SemanticUncertainty;\n    resolveUncertainty(id: string, status: Exclude<SemanticUncertaintyStatus, \'OPEN\'>, resolution: string): SemanticUncertainty;\n    openForRun(runId: string): readonly SemanticUncertainty[];\n}',
+  },
+  {
+    name: 'SemanticUncertainty',
+    declaration: 'export interface SemanticUncertainty {\n    readonly id: string;\n    readonly scope: ScopeRef;\n    readonly runId: string;\n    readonly planId?: string;\n    readonly subject: string;\n    readonly reason: string;\n    readonly alternatives: readonly string[];\n    readonly severity: \'low\' | \'medium\' | \'high\';\n    readonly status: SemanticUncertaintyStatus;\n    readonly sourceRefs: readonly SourceReference[];\n    readonly resolution?: string;\n    readonly createdAt: string;\n    readonly updatedAt: string;\n}',
+  },
+  {
+    name: 'SemanticUncertaintyStatus',
+    declaration: 'export type SemanticUncertaintyStatus = \'OPEN\' | \'RESOLVED\' | \'DISMISSED\';',
   },
   {
     name: 'SendTeamMessageRequest',
@@ -6624,6 +7542,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ShellSandboxInfo {\n    mode: SandboxMode;\n    denied: boolean;\n    enforcement?: SandboxEnforcement;\n    runnerFailed?: boolean;\n}',
   },
   {
+    name: 'SideEffectService',
+    declaration: 'export class SideEffectService {\n    constructor(readonly store: AutoDevStore);\n    plan(input: PlanActionInput): ActionIntent;\n    authorize(id: string, authorization: string, actor: AutoDevAuditActor = { kind: \'autodev-runtime\', source: \'runtime-policy\' }): ActionIntent;\n    start(id: string): ActionIntent;\n    commit(id: string, summary: string, beforeFingerprint?: string, afterFingerprint?: string, evidenceIds: readonly string[] = []): ActionIntent;\n    fail(id: string, summary: string, evidenceIds: readonly string[] = []): ActionIntent;\n    unknown(id: string, summary: string, evidenceIds: readonly string[] = []): ActionIntent;\n    canRetry(intent: ActionIntent): boolean;\n    require(id: string): ActionIntent;\n}',
+  },
+  {
     name: 'SignInAttemptId',
     declaration: 'export type SignInAttemptId = Branded<\'SignInAttemptId\'>;',
   },
@@ -6698,6 +7620,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SkillViewOptions',
     declaration: 'export interface SkillViewOptions extends SkillLookupOptions {\n    readonly scope?: ScopeKey | undefined;\n}',
+  },
+  {
+    name: 'SourceReference',
+    declaration: 'export interface SourceReference {\n    readonly sourceType: \'run\' | \'evidence\' | \'signal\' | \'human\' | \'playbook\' | \'concept\' | \'system\';\n    readonly sourceId: string;\n    readonly runId?: string;\n    readonly evidenceIds?: readonly string[];\n    readonly note?: string;\n}',
   },
   {
     name: 'SpawnTeammateRequest',
@@ -6813,7 +7739,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'SubagentCapabilities',
-    declaration: 'export interface SubagentCapabilities {\n    readonly agentOptions: boolean;\n    readonly outputSchema: boolean;\n    readonly depthLimit: boolean;\n    readonly toolFilter: boolean;\n    readonly persona: boolean;\n}',
+    declaration: 'export interface SubagentCapabilities {\n    readonly agentOptions: boolean;\n    readonly outputSchema: boolean;\n    readonly depthLimit: boolean;\n    readonly toolFilter: boolean;\n    readonly persona: boolean;\n    readonly workspaceCwd?: boolean;\n}',
   },
   {
     name: 'SubagentCatalogEntry',
@@ -6889,7 +7815,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'SubagentStartRequest',
-    declaration: 'export interface SubagentStartRequest {\n    readonly label?: string;\n    readonly prompt: ContentBlock[];\n    readonly parent: Agent;\n    readonly signal: AbortSignal;\n    readonly agentOptions?: AgentOptions;\n    readonly outputSchema?: ObjectJsonSchema;\n    readonly maxDepth?: number;\n    readonly toolFilter?: ToolRestriction;\n    readonly persona?: string;\n}',
+    declaration: 'export interface SubagentStartRequest {\n    readonly label?: string;\n    readonly workspaceCwd?: string;\n    readonly prompt: ContentBlock[];\n    readonly parent: Agent;\n    readonly signal: AbortSignal;\n    readonly agentOptions?: AgentOptions;\n    readonly outputSchema?: ObjectJsonSchema;\n    readonly maxDepth?: number;\n    readonly toolFilter?: ToolRestriction;\n    readonly persona?: string;\n}',
   },
   {
     name: 'SubagentStopReason',
@@ -7414,6 +8340,22 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'UserMessage',
     declaration: 'export interface UserMessage extends MessageBase {\n    readonly role: \'user\';\n}',
+  },
+  {
+    name: 'VerificationCheck',
+    declaration: 'export interface VerificationCheck {\n    readonly id: string;\n    readonly runId: string;\n    readonly planId: string;\n    readonly nodeId?: string;\n    readonly kind: VerificationCheckKind;\n    readonly evidenceType: EvidenceType;\n    readonly required: boolean;\n    readonly description: string;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'VerificationCheckKind',
+    declaration: 'export type VerificationCheckKind = \'baseline\' | \'build\' | \'test\' | \'review\' | \'side-effect\';',
+  },
+  {
+    name: 'VerificationReport',
+    declaration: 'export interface VerificationReport {\n    readonly id: string;\n    readonly runId: string;\n    readonly candidateId?: string;\n    readonly status: EvidenceStatus;\n    readonly requiredCheckIds: readonly string[];\n    readonly resultIds: readonly string[];\n    readonly summary: string;\n    readonly createdAt: string;\n}',
+  },
+  {
+    name: 'VerificationResult',
+    declaration: 'export interface VerificationResult {\n    readonly id: string;\n    readonly runId: string;\n    readonly checkId: string;\n    readonly status: EvidenceStatus;\n    readonly evidenceIds: readonly string[];\n    readonly reason: string;\n    readonly createdAt: string;\n}',
   },
   {
     name: 'VerifiedWebhookDelivery',

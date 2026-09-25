@@ -90,6 +90,49 @@ kind: "package-reference"
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-llm-pi-ai)是每个受支持字段及其 JSDoc 的穷尽式真源。
 
+### 接入本地 Ollama
+
+Ollama 是 LLM 服务端点，不是 Agent 或代码编辑 Provider。通过同一适配器为它配置一个具名路由；模型 ID 使用 `ollama list` 返回的值，OpenAI 兼容 API 根地址需包含 `/v1`：
+
+```yaml
+- name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      ollama-local:
+        displayName: Ollama (local)
+        apiKeyEnv: OLLAMA_LOCAL_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:11434/v1
+        models:
+          - id: qwen3:8b
+            name: Qwen3 8B (local)
+            contextWindow: 32768
+            maxTokens: 4096
+```
+
+默认本地 Ollama 端点不要求鉴权，但 pi-ai 的 OpenAI 兼容客户端要求非空 API key。请在 DSH 凭据存储中为 `OLLAMA_LOCAL_API_KEY` 保存一个无敏感性的本地占位值，或导出该环境变量；不要把值写进 `cordis.patch.yml`。如果路由指向受保护的远程网关，则应存入真实凭据。
+
+如果希望此 Profile 中新建的 DSH Agent 默认使用该路由，请更新已有的默认模型条目：
+
+```yaml
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: ollama-local
+    model: qwen3:8b
+```
+
+这只为 DSH Agent 选择 LLM 路由，不会授予文件系统工具，也不会把 Ollama 变成 AutoDev 编码 Provider。可在仓库根目录运行下面的单轮本地集成用例：
+
+```powershell
+$env:DSH_OLLAMA_BASE_URL = 'http://127.0.0.1:11434/v1'
+$env:DSH_OLLAMA_MODEL = 'qwen3:8b-fast'
+$env:DSH_OLLAMA_API_KEY = 'ollama-local-e2e-placeholder'
+pnpm exec vitest run --config vitest.e2e.config.ts packages/core/agent-loop/tests/ollama-agent.e2e.ts --retry=0 --maxWorkers=1 --no-file-parallelism
+```
+
+上面的凭据仅是供无鉴权本地 Ollama 端点使用的占位值。该定向用例只发出一次模型请求，并验证 DSH Agent 将回答提交到 Session；不会启动 AutoDev，也不会修改文件。
+
 ### 登录提供方
 
 pi-ai 提供登录的提供方可以通过 harness 授权 seam 登录：流程提供 OAuth 或交互式密钥提示（密钥键入 pi-ai 自己的登录提示，而非设置表单），得到的凭据存储在 harness 凭据存储的 `llm-pi-ai/<provider id>` 记录中。存储的登录在其路由的 `apiKeyEnv` 覆盖之下完成认证，并在存储的跨进程锁下自行刷新；退出登录即删除存储记录。落在记录文法之外——小写连字符标识符——的手工声明路由键无法登录，因为对它的记录写入会以 `LlmError('UNSTORABLE_PROVIDER_ID')` 拒绝；这类路由改用 `apiKeyEnv` 或提供方 ambient 设置认证。

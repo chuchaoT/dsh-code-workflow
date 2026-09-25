@@ -150,14 +150,20 @@ describe('publishableImage', () => {
     expect(publishableImage(join(root, 'packages/logo.svg'), realpathSync(root))).toBe(real)
   })
 
-  it('refuses a target whose real path escapes the repository', () => {
+  it('refuses a target whose real path escapes the repository', ({ skip }) => {
     // Publication copies the bytes onto the site, so a reference reaching a
     // build-machine file must not be treated as an image the repository owns.
     const { root } = fixture()
     const outside = mkdtempSync(join(tmpdir(), 'dsh-doc-site-outside-'))
     roots.push(outside)
     writeFileSync(join(outside, 'secret.png'), 'not really a png\n')
-    symlinkSync(join(outside, 'secret.png'), join(root, 'packages/linked.png'))
+    try {
+      symlinkSync(join(outside, 'secret.png'), join(root, 'packages/linked.png'))
+    } catch (error: unknown) {
+      const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined
+      if (code === 'EPERM' || code === 'EACCES') skip('This environment does not permit creating symlink fixtures.')
+      throw error
+    }
 
     expect(publishableImage(join(root, 'packages/linked.png'), realpathSync(root))).toBeUndefined()
     expect(publishableImage(join(outside, 'secret.png'), realpathSync(root))).toBeUndefined()

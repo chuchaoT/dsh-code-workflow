@@ -71,7 +71,7 @@ type ResolvedConfig = Omit<Required<Config>, 'model'> & Pick<Config, 'model'>
 /* jscpd:ignore-start -- Cordis registration and shared-seam plumbing mirror
  * the Codex sibling; each product's lifecycle remains package-private. */
 class ClaudeCodeProvider implements SubagentProvider {
-  readonly capabilities: SubagentCapabilities = NO_START_CAPABILITIES
+  readonly capabilities: SubagentCapabilities = { ...NO_START_CAPABILITIES, workspaceCwd: true }
   readonly inheritsParentContext = false
 
   constructor(
@@ -82,10 +82,8 @@ class ClaudeCodeProvider implements SubagentProvider {
 
   async start(request: ResolvedSubagentStartRequest) {
     const parentCwd = request.parent.session.header.cwd
-    if (parentCwd === undefined) {
-      throw new Error(
-        'subagent-claude-code: no working directory for the child — delegate from a parent session that has one',
-      )
+    if (request.workspaceCwd === undefined && parentCwd === undefined) {
+      throw new Error('subagent-claude-code: no working directory for the child — delegate from a parent session that has one')
     }
     let cwd: string
     try {
@@ -93,6 +91,7 @@ class ClaudeCodeProvider implements SubagentProvider {
         'subagent-claude-code',
         undefined,
         parentCwd,
+        request.workspaceCwd,
       )
     } catch (error: unknown) {
       if (request.signal.aborted) {

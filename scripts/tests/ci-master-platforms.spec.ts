@@ -118,6 +118,27 @@ describe('master-only platform scheduling', () => {
     expect(preflight.run).toContain('exit 1')
   })
 
+  it('runs focused AutoDev process-recovery tests on native Linux and macOS', () => {
+    const master = workflow('ci-master.yml')
+    expect(master.on.workflow_dispatch).toMatchObject({
+      inputs: {
+        suite: { options: ['larger-runner-benchmark', 'consolidated-runner-benchmark', 'autodev-recovery'] },
+      },
+    })
+    const recovery = master.jobs['autodev-posix-recovery']!
+    expect(recovery).toMatchObject({
+      if: "github.event_name == 'push' && github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch' && inputs.suite == 'autodev-recovery'",
+      name: 'AutoDev / ${{ matrix.os }} SIGKILL recovery',
+      'runs-on': '${{ matrix.os }}',
+      strategy: { 'fail-fast': false, matrix: { os: ['ubuntu-latest', 'macos-latest'] } },
+    })
+    expect(recovery.steps).toContainEqual(expect.objectContaining({
+      name: 'Run AutoDev Host process-death recovery (M10-M13)',
+      run: 'pnpm exec vitest run --root . packages/experimental/autodev/tests/core.spec.ts -t "kills the Host during|promote Gate claim after SIGKILL"',
+    }))
+    expect(recovery['continue-on-error']).toBeUndefined()
+  })
+
   it('runs Wine once on hosted master CI and seeds its own apt cache', () => {
     const master = workflow('ci-master.yml')
     const wine = master.jobs.windows!

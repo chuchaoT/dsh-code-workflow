@@ -520,6 +520,40 @@ describe('cwd resolution', () => {
     }
   })
 
+  it('prefers an explicit per-run workspace cwd over configured and parent cwd', async () => {
+    const configured = realpathSync(mkdtempSync(join(tmpdir(), 'acp-cfg-cwd-')))
+    const parentDir = realpathSync(mkdtempSync(join(tmpdir(), 'acp-parent-cwd-')))
+    const worktree = realpathSync(mkdtempSync(join(tmpdir(), 'acp-run-cwd-')))
+    try {
+      const ctx = new Context()
+      await ctx.plugin(SessionProjectionRegistry)
+      await ctx.plugin(SubagentRuntime)
+      await ctx.plugin(LocalSubprocessRuntime)
+      await ctx.plugin(acp, {
+        providerName: 'acp',
+        command: process.execPath,
+        args: [mockServer],
+        cwd: configured,
+        permission: 'reject',
+        env: { MOCK_ECHO_CWD: '1' },
+      })
+      const parent = { id: 'parent', session: { header: { cwd: parentDir } } } as unknown as Agent
+      const run = await ctx.subagents.start('acp', {
+        prompt: [{ type: 'text' as const, text: 'p' }],
+        parent,
+        workspaceCwd: worktree,
+        signal: new AbortController().signal,
+      })
+      const result = await run.result
+      await run.dispose()
+      expect(text(result.output)).toBe(`${worktree}\n${worktree}`)
+    } finally {
+      rmSync(configured, { recursive: true, force: true })
+      rmSync(parentDir, { recursive: true, force: true })
+      rmSync(worktree, { recursive: true, force: true })
+    }
+  })
+
   it('resolves a relative config cwd against the launch directory at load', async () => {
     // The child process AND its announced ACP session cwd must both get the
     // ABSOLUTE form — DSH's own ACP server rejects a relative session cwd, and
@@ -1690,7 +1724,7 @@ describe('dsh-subagent-acp', () => {
     }
   })
 
-  it('advertises no start-time capabilities (out-of-process child)', async () => {
+  it('advertises only the per-run workspace cwd start-time capability', async () => {
     const ctx = await setup()
     const provider = ctx.subagents.getProvider('acp')!
     expect(provider.capabilities).toEqual({
@@ -1699,6 +1733,7 @@ describe('dsh-subagent-acp', () => {
       depthLimit: false,
       toolFilter: false,
       persona: false,
+      workspaceCwd: true,
     })
   })
 

@@ -711,6 +711,31 @@ describe('task admission and package contracts', () => {
     await ctx.fiber.dispose()
   })
 
+  it('starts in the explicit per-run workspace cwd even when the parent has none', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(LocalSubprocessRuntime)
+    const child = fakeChild()
+    vi.spyOn(ctx.subprocess, 'spawn').mockReturnValue(child.handle)
+    await ctx.plugin(codex, {})
+
+    const starting = ctx.subagents.start('codex', {
+      ...request(),
+      parent: { id: 'parent-without-cwd', session: { header: {} } } as unknown as Agent,
+      workspaceCwd: process.cwd(),
+    })
+    const initialize = await child.peer.nextMethod('initialize')
+    child.peer.respond(initialize, { userAgent: 'codex-cli 0.153.4' })
+    await child.peer.nextMethod('initialized')
+    const threadStart = await child.peer.nextMethod('thread/start')
+    expect(threadStart.params).toMatchObject({ cwd: process.cwd() })
+    child.peer.respond(threadStart, { thread: { id: 'thread-workspace-cwd', ephemeral: true } })
+    const run = await starting
+    await run.dispose()
+    await ctx.fiber.dispose()
+  })
+
   it('keeps the namespace export shape', () => {
     expect('default' in codex).toBe(false)
     expect(codex.name).toBe('subagent-codex')

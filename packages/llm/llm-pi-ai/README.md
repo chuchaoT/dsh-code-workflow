@@ -90,6 +90,49 @@ Each profile may set a `retryPolicy`; omission uses normal mode with five retrie
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-llm-pi-ai) is the exhaustive source for every accepted field and its JSDoc.
 
+### Route a local Ollama server
+
+Ollama is an LLM endpoint, not an agent or a file-editing provider. Give it a named route through the same adapter; use a model id returned by `ollama list` and the OpenAI-compatible API root, including `/v1`:
+
+```yaml
+- name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      ollama-local:
+        displayName: Ollama (local)
+        apiKeyEnv: OLLAMA_LOCAL_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:11434/v1
+        models:
+          - id: qwen3:8b
+            name: Qwen3 8B (local)
+            contextWindow: 32768
+            maxTokens: 4096
+```
+
+The default local Ollama endpoint does not require authentication, but pi-ai's OpenAI-compatible client requires a non-empty API key. Store a harmless local placeholder under the `OLLAMA_LOCAL_API_KEY` credential reference in DSH, or export that variable; keep the value out of `cordis.patch.yml`. Use the real credential instead if a remote gateway protects the route.
+
+To make newly created DSH Agents in this profile use the route by default, update the existing default-model entry:
+
+```yaml
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: ollama-local
+    model: qwen3:8b
+```
+
+This selects an LLM route for a DSH Agent; it does not grant filesystem tools or make Ollama an AutoDev coding Provider. The one-turn local integration can be run from the repository root with:
+
+```powershell
+$env:DSH_OLLAMA_BASE_URL = 'http://127.0.0.1:11434/v1'
+$env:DSH_OLLAMA_MODEL = 'qwen3:8b-fast'
+$env:DSH_OLLAMA_API_KEY = 'ollama-local-e2e-placeholder'
+pnpm exec vitest run --config vitest.e2e.config.ts packages/core/agent-loop/tests/ollama-agent.e2e.ts --retry=0 --maxWorkers=1 --no-file-parallelism
+```
+
+The credential above is only a local placeholder for an unauthenticated Ollama endpoint. This focused test makes one model request and verifies that the DSH Agent commits its response to the Session; it does not run AutoDev or edit files.
+
 ### Sign in to a provider
 
 A provider pi-ai ships a login for can be signed into through the harness authorization seam: the flow offers OAuth or an interactive key prompt (a key is typed into pi-ai's own login prompt, not into the settings form), and the resulting credential is stored in the harness credential store at `llm-pi-ai/<provider id>`. The stored sign-in authenticates its route beneath any `apiKeyEnv` override and refreshes itself under the store's cross-process lock; signing out deletes the stored record. A hand-declared route key outside the record grammar — a lowercase hyphenated identifier — cannot be signed into, because a record write for it refuses with `LlmError('UNSTORABLE_PROVIDER_ID')`; such a route authenticates through `apiKeyEnv` or ambient provider settings instead.

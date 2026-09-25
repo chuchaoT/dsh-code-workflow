@@ -133,6 +133,8 @@ export interface SubagentCapabilities {
   readonly depthLimit: boolean
   readonly toolFilter: boolean
   readonly persona: boolean
+  /** The provider applies a caller-supplied per-run workspace cwd instead of inheriting the parent's cwd. */
+  readonly workspaceCwd?: boolean
 }
 
 /**
@@ -145,12 +147,19 @@ export interface SubagentCapabilities {
 export interface SubagentStartRequest {
   /** Optional short display label persisted with a session-backed child. */
   readonly label?: string
+  /**
+   * Optional absolute working directory for this one child run. Providers must
+   * advertise `capabilities.workspaceCwd` and validate the directory before
+   * starting; a prompt mentioning a path does not change the child cwd.
+   */
+  readonly workspaceCwd?: string
   /** Content delivered as the child's user message. */
   readonly prompt: ContentBlock[]
   /**
-   * The spawning agent. In-process providers derive workspace, lineage, and
-   * delegation depth from its durable session state. ACP reads only its cwd,
-   * and only when no deployment `cwd` override is configured.
+   * The spawning agent. In-process providers derive lineage and delegation
+   * depth from its durable session state. Providers use its cwd only as a
+   * fallback when neither this request's `workspaceCwd` nor their configured
+   * workspace override supplies a directory.
    */
   readonly parent: Agent
   /**

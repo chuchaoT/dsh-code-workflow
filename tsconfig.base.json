@@ -173,6 +173,8 @@
       "@deepseek-ai/dsh-scope/invariant": ["./packages/core/scope/src/invariant.ts"],
       "@deepseek-ai/dsh-agent-loop/invariant": ["./packages/core/agent-loop/src/invariant.ts"],
       "@deepseek-ai/dsh-experimental-agent-team/invariant": ["./packages/experimental/agent-team/src/invariant.ts"],
+      "@deepseek-ai/dsh-experimental-autodev": ["./packages/experimental/autodev/src"],
+      "@deepseek-ai/dsh-experimental-autodev/*": ["./packages/experimental/autodev/src/*"],
       // host/client package names prefix the group dir (dsh-client-<dir>), so
       // the generated aliases below — which map a package only when its name is
       // exactly dsh-<dir> — skip them; strip the group prefix with a dedicated

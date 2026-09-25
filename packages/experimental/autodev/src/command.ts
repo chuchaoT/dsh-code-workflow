@@ -4,6 +4,7 @@ import { spawn as nodeSpawn } from 'node:child_process'
 import type { Readable } from 'node:stream'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 
+/** Bounded result captured from one argv-based command execution. */
 export interface CommandResult {
   readonly argv: readonly string[]
   readonly cwd: string
@@ -15,6 +16,7 @@ export interface CommandResult {
   readonly durationMs: number
 }
 
+/** Execution seam used by Git, Drivers, and Provider adapters. */
 export interface CommandExecutor {
   run(argv: readonly string[], cwd: string, options?: {
     readonly signal?: AbortSignal | undefined
@@ -36,6 +38,10 @@ export class HarnessCommandExecutor implements CommandExecutor {
   } = {}): Promise<CommandResult> {
     if (argv.length === 0 || argv[0] === undefined || argv[0].length === 0) {
       throw new TypeError('command argv must contain a non-empty executable')
+    }
+    options.signal?.throwIfAborted()
+    if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(argv[0])) {
+      throw new TypeError('Windows batch wrappers cannot run without a shell; configure a directly executable binary or JavaScript CLI')
     }
     if (this.subprocess !== undefined) {
       return this.runWithHarness(this.subprocess, argv, cwd, options)

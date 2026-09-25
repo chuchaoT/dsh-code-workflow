@@ -647,7 +647,7 @@ Business Concept 是项目中的业务语义身份，而不是代码实现猜测
 - Observation 的来源和 Evidence。
 - Candidate / Established / Deprecated 状态。
 
-Agent 只能提出 Candidate。`correctConcept` 代表显式人类纠正，会使用最高优先级的人类 provenance，并建立修正后的 Concept 版本。
+Agent 只能提出 Candidate。`correctConcept` 代表显式人类纠正，会记录最高优先级的人类来源引用，并建立修正后的 Concept 版本。
 
 ### 11.4 Playbook
 

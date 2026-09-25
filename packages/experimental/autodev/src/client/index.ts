@@ -18,10 +18,9 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 
 const NS = 'autodev'
 
-export const inject = ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs', 'remote', 'commandUi']
+export const inject = ['remote']
 
-export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
-  const disposeRemote = await ctx.remote.$mount(autodevRemote)
+function registerUi(ctx: ClientContext): void {
   const t = ctx.locale.bind(NS)
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'autodev client dictionaries')
   ctx.effect(() => ctx.sidebarRightTabs.register(autoDevDefinition(() => t('title'), () => t('description'))), 'autodev client tab type')
@@ -31,12 +30,27 @@ export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
     locale: NS,
     inject: (): AutoDevPanelInjected => ({ remote: ctx.remote.autodev }),
   }, AutoDevPanel)), 'autodev client tab body')
-  ctx.inject(['commandUi'], scope => scope.effect(() => scope.commandUi.register({
+  ctx.effect(() => ctx.commandUi.register({
     name: 'autodev',
     label: () => t('commandLabel'),
     description: () => t('commandDescription'),
     available: () => true,
     ui: { kind: 'action', run: (session) => { ctx.sidebarRight.openTabIn(session.sessionId, AUTODEV_KIND) } },
-  }), 'autodev client command'))
-  return async () => { await disposeRemote() }
+  }), 'autodev client command')
+}
+
+export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
+  const disposeRemote = await ctx.remote.$mount(autodevRemote)
+  const ui = ctx.inject(['remote.autodev', 'slots', 'locale', 'sidebarRight', 'sidebarRightTabs', 'commandUi'], registerUi)
+  try {
+    await ui
+  } catch (error) {
+    await ui.dispose()
+    await disposeRemote()
+    throw error
+  }
+  return async () => {
+    await ui.dispose()
+    await disposeRemote()
+  }
 }

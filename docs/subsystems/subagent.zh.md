@@ -32,12 +32,14 @@ interface SubagentCapabilities {
   readonly depthLimit: boolean
   readonly toolFilter: boolean
   readonly persona: boolean
+  /** The provider applies a caller-supplied per-run workspace cwd instead of inheriting the parent's cwd. */
+  readonly workspaceCwd?: boolean
 }
 ```
 
 ## 单次启动请求
 
-工具层根据模型输入和自身配置构建此请求；服务在 `start` 之前针对指定提供方进行校验。必填的 `parent` 提供会话 cwd、谱系与委派深度。可选的 Agent 提供方、模型、推理强度与 token 覆盖、output schema、depth、工具过滤器和 persona 需要对应的能力 flag 匹配。进程内后端会把 `agentOptions` 合并到父 Agent 选项之上，将 filter 和 persona 的作用域限定在子 agent 创建阶段，并通过强制 capture 工具实现所支持的 object-rooted schema。DSH SDK 后端会把四个 Agent 路由字段合并到实例默认值之上，并在子运行时初始化期间校验；ACP、Codex 与 Claude Code 会在启动传输前拒绝 `agentOptions`。
+工具层根据模型输入和自身配置构建此请求；服务在 `start` 之前针对指定提供方进行校验。必填的 `parent` 提供谱系与委派深度；只有调用方没有指定逐次工作目录且 Provider 没有配置目录时，才回退到父 Session cwd。`workspaceCwd` 可为本次运行选择一个绝对工作目录；Provider 必须声明对应能力并在启动前校验。它只将子 Agent 定向到某个工作区，不是操作系统沙箱或权限边界。可选的 Agent 提供方、模型、推理强度与 token 覆盖、output schema、depth、工具过滤器和 persona 需要对应的能力 flag 匹配。进程内后端会把 `agentOptions` 合并到父 Agent 选项之上，将 filter 和 persona 的作用域限定在子 agent 创建阶段，并通过强制 capture 工具实现所支持的 object-rooted schema。DSH SDK 后端会把四个 Agent 路由字段合并到实例默认值之上，并在子运行时初始化期间校验；ACP、Codex 与 Claude Code 会在启动传输前拒绝 `agentOptions`。
 
 ```ts type-equiv
 /**
@@ -50,12 +52,19 @@ interface SubagentCapabilities {
 interface SubagentStartRequest {
   /** Optional short display label persisted with a session-backed child. */
   readonly label?: string
+  /**
+   * Optional absolute working directory for this one child run. Providers must
+   * advertise `capabilities.workspaceCwd` and validate the directory before
+   * starting; a prompt mentioning a path does not change the child cwd.
+   */
+  readonly workspaceCwd?: string
   /** Content delivered as the child's user message. */
   readonly prompt: ContentBlock[]
   /**
-   * The spawning agent. In-process providers derive workspace, lineage, and
-   * delegation depth from its durable session state. ACP reads only its cwd,
-   * and only when no deployment `cwd` override is configured.
+   * The spawning agent. In-process providers derive lineage and delegation
+   * depth from its durable session state. Providers use its cwd only as a
+   * fallback when neither this request's `workspaceCwd` nor their configured
+   * workspace override supplies a directory.
    */
   readonly parent: Agent
   /**

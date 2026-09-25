@@ -1,7 +1,7 @@
 /**
  * Out-of-process ACP subagent backend. Each child has its own process, session, model, and
- * tools, so it shares no Cordis context and advertises no parent-enforced start capabilities;
- * the ONE thing it reads off `request.parent` is the session's workspace cwd (see
+ * tools, so it shares no Cordis context and advertises only the per-run workspace-cwd
+ * capability; absent an explicit `workspaceCwd`, it reads the parent's session cwd (see
  * {@link resolveCwd}). This plugin uses named exports only; a default would hide its
  * loader metadata (see `docs/postmortem/0001-acp-default-export-drops-inject.md`).
  * @module @deepseek-ai/dsh-subagent-acp
@@ -130,6 +130,9 @@ function assertUsableCwd(label: string, cwd: string): string {
  * workspace (one server process serves many sessions, each with its own cwd).
  */
 function resolveCwd(configured: string | undefined, request: SubagentStartRequest): string {
+  if (request.workspaceCwd !== undefined) {
+    return assertUsableCwd('requested workspace cwd', request.workspaceCwd)
+  }
   if (configured !== undefined) return configured
   const parentCwd = request.parent.session.header.cwd
   if (parentCwd === undefined) {
@@ -139,9 +142,8 @@ function resolveCwd(configured: string | undefined, request: SubagentStartReques
 }
 
 /**
- * The ACP provider. Advertises NO start-time capabilities: an out-of-process
- * child cannot honor `agentOptions`/`outputSchema`/`maxDepth`/`toolFilter`/
- * `persona` (the service rejects a request needing any before `start` runs).
+ * The ACP provider honors a per-run workspace cwd but cannot honor
+ * `agentOptions`/`outputSchema`/`maxDepth`/`toolFilter`/`persona`.
  */
 class AcpProvider implements SubagentProvider {
   readonly capabilities: SubagentCapabilities = {
@@ -150,6 +152,7 @@ class AcpProvider implements SubagentProvider {
     depthLimit: false,
     toolFilter: false,
     persona: false,
+    workspaceCwd: true,
   }
   // Context contract: an out-of-process ACP child starts fresh — no parent conversation crosses the process boundary.
   readonly inheritsParentContext = false

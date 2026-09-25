@@ -14,6 +14,7 @@ const DEFAULT_ENDPOINT = 'https://api.typesafe.ai/v1/systemone'
 const DEFAULT_MODEL = 'system-one'
 const DEFAULT_QUESTION_SET = 'autodev.v1'
 
+/** Jev could not supply a valid answer under the configured retry and policy rules. */
 export class JevUnavailableError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
@@ -21,6 +22,7 @@ export class JevUnavailableError extends Error {
   }
 }
 
+/** Transport-independent contract for a provider of typed Jev decisions. */
 export interface DecisionProvider {
   evaluate(request: DecisionRequest): Promise<DecisionResult>
 }
@@ -96,6 +98,7 @@ export class HttpJevProvider implements DecisionProvider {
   }
 }
 
+/** Optional Jev transport and deterministic fallback providers for the coordinator. */
 export interface DecisionCoordinatorOptions {
   readonly config?: JevConfig
   readonly provider?: DecisionProvider
@@ -104,6 +107,7 @@ export interface DecisionCoordinatorOptions {
 
 /** Applies the required/advisory/off policy around a real or static provider. */
 export class DecisionCoordinator {
+  /** Resolved mode, confidence, endpoint, and data-sharing configuration. */
   readonly config: Required<Pick<JevConfig, 'mode' | 'questionSetVersion'>> & JevConfig
   private readonly provider: DecisionProvider
   private readonly staticProvider: DecisionProvider
@@ -119,6 +123,14 @@ export class DecisionCoordinator {
     this.staticProvider = options.staticProvider ?? new StaticDecisionProvider()
   }
 
+  /** Evaluate a bounded decision request and apply required/advisory/off policy.
+   * @param purpose - Decision category whose confidence policy applies.
+   * @param state - Structured state supplied to Jev after path sanitization.
+   * @param signal - Cancellation signal for the provider request.
+   * @param customQuestions - Optional versioned questions replacing the built-in set.
+   * @returns Validated answers, state hash, question-set version, and optional degradation note.
+   * @throws JevUnavailableError when required mode cannot obtain an acceptable answer.
+   */
   async evaluate(
     purpose: DecisionPurpose,
     state: unknown,
@@ -156,6 +168,10 @@ export class DecisionCoordinator {
   }
 }
 
+/** Return the stable, typed question set for one supported decision category.
+ * @param purpose - Decision category to ask.
+ * @returns The versioned questions associated with that category.
+ */
 export function questionsFor(purpose: DecisionPurpose): readonly JevQuestion[] {
   switch (purpose) {
     case 'agent-route':
@@ -172,10 +188,20 @@ export function questionsFor(purpose: DecisionPurpose): readonly JevQuestion[] {
   }
 }
 
+/** Replace the choice list of the provider-selection question without changing other questions.
+ * @param questions - Existing typed question set.
+ * @param choices - Eligible Provider names offered to the decision provider.
+ * @returns A new question list with only the provider choices replaced.
+ */
 export function replaceQuestionChoices(questions: readonly JevQuestion[], choices: readonly string[]): readonly JevQuestion[] {
   return questions.map(question => question.id === 'provider' ? { ...question, choices } : question)
 }
 
+/** Find one answer by its stable question identity.
+ * @param result - Provider result containing typed answers.
+ * @param questionId - Question identity to retrieve.
+ * @returns The matching answer, or `undefined` when it was not supplied.
+ */
 export function answerOf(result: DecisionResult, questionId: string): DecisionAnswer | undefined {
   return result.answers.find(answer => answer.questionId === questionId)
 }

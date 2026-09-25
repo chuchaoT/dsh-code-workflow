@@ -29,7 +29,7 @@ Mount this provider when a composition needs a fully isolated, out-of-process ch
 
 ### When to choose it
 
-Choose this backend when the child must run with its own runtime, model, and tools in a separate process — for example an ACP agent from another project — or when you want delegation that cannot touch the parent harness. Choose an in-process backend when the child must share the parent's composition or honor parent-enforced capabilities: this provider advertises no optional start-time capabilities, so the seam rejects requests for `agentOptions`, structured output, depth caps, tool filters, or personas rather than silently omitting them.
+Choose this backend when the child must run with its own runtime, model, and tools in a separate process — for example an ACP agent from another project — or when you want delegation that cannot touch the parent harness. It advertises the per-run `workspaceCwd` capability so callers such as AutoDev can select a managed Worktree; this is only a cwd guarantee, not an OS sandbox. The provider does not advertise `agentOptions`, structured output, depth caps, tool filters, or personas, so the seam rejects those requests rather than silently omitting them.
 
 ### Configuration
 
@@ -38,7 +38,7 @@ Choose this backend when the child must run with its own runtime, model, and too
 | `providerName` | `acp` | Registry name on `ctx.subagents` |
 | `command` | required | Executable spawned for each run (the child ACP agent) |
 | `args` | `[]` | Command arguments |
-| `cwd` | parent session cwd | Working-directory override for the child process and its ACP session |
+| `cwd` | parent session cwd | Static working-directory fallback for the child process and its ACP session; a per-run `workspaceCwd` request takes precedence |
 | `permission` | `reject` | Auto-answer permission requests by rejecting, or choosing the first `allow_once` or `allow_always` option (`allow`) |
 | `env` | `{}` | Explicit child environment layered over the credential-scrubbed parent environment |
 | `disposeEofGraceMs` | `6000` | Grace after stdin EOF before platform termination |
@@ -91,7 +91,7 @@ This section explains how the backend drives a child over ACP and where the obse
 
 ### Start and ownership flow
 
-A start resolves the child's working directory (the configured `cwd` override, else the parent session's cwd), spawns the command through the subprocess seam, performs the ACP `initialize` and `newSession` handshake, and only then publishes the run. Fulfillment means a remote session is ready and ownership has transferred to the caller. Disposal is idempotent: it closes stdin and waits a configured grace for cooperative quiescence, then escalates through SIGTERM to SIGKILL and awaits whole-range exit. Cleanup failures remain observable as ordered safe facts and never claim quiescence.
+A start resolves the child's working directory (the caller's per-run `workspaceCwd`, else the configured `cwd`, else the parent session's cwd), validates it, spawns the command through the subprocess seam, performs the ACP `initialize` and `newSession` handshake, and only then publishes the run. Fulfillment means a remote session is ready and ownership has transferred to the caller. Disposal is idempotent: it closes stdin and waits a configured grace for cooperative quiescence, then escalates through SIGTERM to SIGKILL and awaits whole-range exit. Cleanup failures remain observable as ordered safe facts and never claim quiescence.
 
 ### Stop-reason mapping
 
@@ -158,7 +158,7 @@ These limits define when this backend is a poor fit or needs special operational
 
 - **A fresh process per run** — there is no process pooling; each delegation pays the full spawn and ACP handshake cost.
 - **Local workspaces only** — the resolved working directory is a local path handed to a child on the same machine; remote workspace mapping is not designed.
-- **No optional start-time capabilities** — this provider cannot apply `agentOptions`, `outputSchema`, a depth cap, a tool filter, or a persona inside the remote process, so the seam rejects requests that require them.
+- **Limited start-time capabilities** — this provider applies and validates `workspaceCwd`, but cannot apply `agentOptions`, `outputSchema`, a depth cap, a tool filter, or a persona inside the remote process, so the seam rejects requests that require them.
 - **Only committed `agent_message_chunk` text is collected** — the automation server keeps reasoning, tool activity, plans, and other trace data in the child session log rather than emitting them on ACP.
 - **Permission prompts are auto-answered** (`permission: allow | reject`) — no human is surfaced a child's `session/request_permission`.
 

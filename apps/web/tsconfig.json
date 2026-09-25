@@ -147,6 +147,7 @@
     "tests/background-job-list.e2e.ts",
     "tests/live-job-stream.e2e.ts",
     "tests/auto-review-denial.e2e.ts",
+    "tests/autodev-workbench.e2e.ts",
     "tests/bash-abort-row.e2e.ts",
     "tests/skill-tool-row.e2e.ts",
     "tests/tool-details.e2e.ts",
