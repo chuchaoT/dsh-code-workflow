@@ -113,12 +113,13 @@ describe('AutoDev sidebar task authoring', () => {
 
     fireEvent.change(screen.getByLabelText(zh.repoPath), { target: { value: ' C:/isolated/repo ' } })
     fireEvent.change(screen.getByLabelText(zh.requestInput), { target: { value: ' Add a test ' } })
+    fireEvent.change(screen.getByLabelText(zh.mode), { target: { value: 'TEST' } })
     fireEvent.change(screen.getByLabelText(zh.acceptanceCriteria), { target: { value: 'file exists\n\ntests pass' } })
     fireEvent.change(screen.getByLabelText(zh.buildDriver), { target: { value: 'node' } })
     fireEvent.click(screen.getByRole('button', { name: zh.create }))
 
     await waitFor(() => expect(create).toHaveBeenCalledWith({
-      repoPath: 'C:/isolated/repo', request: 'Add a test', acceptanceCriteria: ['file exists', 'tests pass'], buildDriver: 'node',
+      repoPath: 'C:/isolated/repo', request: 'Add a test', mode: 'TEST', acceptanceCriteria: ['file exists', 'tests pass'], buildDriver: 'node',
     }))
     expect(await screen.findByText(zh.reviewBeforeRun)).toBeTruthy()
     expect(screen.getByText(/Implement the change/)).toBeTruthy()

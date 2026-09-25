@@ -5,7 +5,7 @@
     "outDir": "lib/types",
     "tsBuildInfoFile": "lib/tsconfig.client.tsbuildinfo"
   },
-  "include": ["src/client/**/*", "src/contracts.ts", "src/protocol.ts"],
+  "include": ["src/client/**/*", "src/contracts.ts", "src/protocol.ts", "src/mode.ts"],
   "references": [
     { "path": "../../../vendor/cordis" },
     { "path": "../../api/remotes/tsconfig.client.json" },

@@ -24,40 +24,54 @@ export interface VerificationEvaluation {
  * @param run - Run that owns the verification checks.
  * @param plan - Active immutable Plan version.
  * @param createdAt - Timestamp shared by the generated checks.
- * @returns Baseline, Build, Test, Review and Side Effect checks for the Plan.
+ * @returns Mode-specific required checks, with original checks retained for legacy Plans.
  */
 export function defaultVerificationChecks(run: Run, plan: PlanVersion, createdAt: string): readonly VerificationCheck[] {
   const buildNodeId = plan.nodes.find(node => node.kind === 'build')?.id
   const testNodeId = plan.nodes.find(node => node.kind === 'test')?.id
-  return [
+  const legacyPlan = plan.mode === undefined && run.mode === undefined
+  const checks: VerificationCheck[] = [
     {
       id: `${run.id}:${plan.id}:baseline`, runId: run.id, planId: plan.id, kind: 'baseline',
       evidenceType: 'REPOSITORY_BASELINE', required: true,
       description: 'A clean repository baseline must be captured before execution', createdAt,
     },
-    {
-      id: `${run.id}:${plan.id}:build`, runId: run.id, planId: plan.id, kind: 'build',
-      ...(buildNodeId === undefined ? {} : { nodeId: buildNodeId }),
-      evidenceType: 'BUILD', required: true,
-      description: 'The candidate must pass the deterministic build command', createdAt,
-    },
-    {
-      id: `${run.id}:${plan.id}:test`, runId: run.id, planId: plan.id, kind: 'test',
-      ...(testNodeId === undefined ? {} : { nodeId: testNodeId }),
-      evidenceType: 'TEST', required: true,
-      description: 'The candidate must pass the deterministic test command', createdAt,
-    },
-    {
-      id: `${run.id}:${plan.id}:review`, runId: run.id, planId: plan.id, kind: 'review',
+  ]
+  if (buildNodeId !== undefined || legacyPlan) checks.push({
+    id: `${run.id}:${plan.id}:build`, runId: run.id, planId: plan.id, kind: 'build',
+    ...(buildNodeId === undefined ? {} : { nodeId: buildNodeId }),
+    evidenceType: 'BUILD', required: true,
+    description: 'The candidate must pass the deterministic build command', createdAt,
+  })
+  if (testNodeId !== undefined || legacyPlan) checks.push({
+    id: `${run.id}:${plan.id}:test`, runId: run.id, planId: plan.id, kind: 'test',
+    ...(testNodeId === undefined ? {} : { nodeId: testNodeId }),
+    evidenceType: 'TEST', required: true,
+    description: 'The candidate must pass the deterministic test command', createdAt,
+  })
+  if (plan.mode === 'EXPLORE' || plan.mode === 'IMPACT' || plan.mode === 'RELEASE') {
+    checks.push({
+      id: `${run.id}:${plan.id}:analysis`, runId: run.id, planId: plan.id,
+      ...(plan.nodes[0] === undefined ? {} : { nodeId: plan.nodes[0].id }), kind: 'analysis', evidenceType: 'ANALYSIS', required: true,
+      description: 'The requested read-only analysis must be captured by the Agent Protocol', createdAt,
+    })
+  } else {
+    const reviewNodeId = plan.nodes.find(node => node.kind === 'review')?.id
+    checks.push({
+      id: `${run.id}:${plan.id}:review`, runId: run.id, planId: plan.id,
+      ...(reviewNodeId === undefined ? {} : { nodeId: reviewNodeId }), kind: 'review',
       evidenceType: 'REVIEW', required: true,
-      description: 'Quality/review Evidence must be a PASS before completion', createdAt,
-    },
+      description: 'A structured review or trusted Jev quality review must pass', createdAt,
+    })
+  }
+  checks.push(
     {
       id: `${run.id}:${plan.id}:side-effect`, runId: run.id, planId: plan.id, kind: 'side-effect',
       evidenceType: 'SIDE_EFFECT', required: true,
       description: 'Every external or workspace side effect must have a known PASS outcome before completion', createdAt,
     },
-  ]
+  )
+  return checks
 }
 
 /**
@@ -82,7 +96,11 @@ export function evaluateVerification(
       .filter(item => item.runId === check.runId && item.type === check.evidenceType)
       .filter((item) => {
         if (check.kind === 'baseline') return item.planId === undefined || item.planId === check.planId
-        if (candidate === undefined || candidate.runId !== check.runId || candidate.planId !== check.planId) return false
+        if (item.planId !== check.planId) return false
+        if (candidate === undefined) {
+          return item.candidateId === undefined && (item.attempt === undefined || item.attempt > 0)
+        }
+        if (candidate.runId !== check.runId || candidate.planId !== check.planId) return false
         if (item.candidateId !== candidate.id || item.planId !== check.planId) return false
         if (candidate.attempt !== undefined && item.attempt !== candidate.attempt) return false
         if (check.nodeId !== undefined && item.nodeId !== check.nodeId) return false

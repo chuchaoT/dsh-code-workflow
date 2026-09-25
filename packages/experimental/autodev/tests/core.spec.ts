@@ -18,6 +18,7 @@ import { DecisionCoordinator, HttpJevProvider, JevUnavailableError, questionsFor
 import { AgentProtocol, isValidAgentSignalEnvelope, normalizeSignal, type AutoDevAgentContext, type AgentTask } from '../src/protocol.ts'
 import { commandProvider, ProviderRouter } from '../src/router.ts'
 import { defaultVerificationChecks, evaluateVerification } from '../src/verification.ts'
+import { trustedTestDecisions } from './harness.ts'
 
 const tempRoots: string[] = []
 
@@ -178,6 +179,35 @@ describe('Jev boundary', () => {
 
     const required = new DecisionCoordinator({ config: { mode: 'required' }, provider: unavailable })
     await expect(required.evaluate('completion', {}, signal)).rejects.toBeInstanceOf(JevUnavailableError)
+  })
+
+  it('routes decisions through dynamically registered providers and audits their identity', async () => {
+    const coordinator = new DecisionCoordinator({
+      config: { mode: 'required' },
+      provider: { evaluate: async () => { throw new Error('primary unavailable') } },
+    })
+    const dispose = coordinator.registerProvider('local-qwen', {
+      async evaluate(request) {
+        return {
+          source: 'jev', modelVersion: 'qwen3-small-fixture',
+          answers: request.questions.map(question => ({
+            questionId: question.id, kind: question.type,
+            value: question.type === 'choice' ? question.choices?.[0] ?? 'ready_for_verify'
+              : question.type === 'score' ? question.max ?? 0 : false,
+            probability: 0.9,
+          })),
+        }
+      },
+    }, 10)
+    try {
+      const result = await coordinator.evaluate('completion', {}, new AbortController().signal)
+      expect(result.providerId).toBe('local-qwen')
+      expect(result.source).toBe('jev')
+    } finally {
+      dispose()
+    }
+    await expect(coordinator.evaluate('completion', {}, new AbortController().signal))
+      .rejects.toThrow(/jev-http: primary unavailable/)
   })
 
   it('hard-gates invalid answers and low confidence instead of trusting model output', async () => {
@@ -549,7 +579,7 @@ describe('dynamic Provider routing', () => {
       start,
     } as unknown as SubagentRuntime
     const router = new ProviderRouter({
-      decisions: new DecisionCoordinator({ config: { mode: 'off' } }),
+      decisions: trustedTestDecisions(),
       subagents,
     })
     const signal = new AbortController().signal
@@ -1267,6 +1297,7 @@ describe('AutoDev end-to-end run', () => {
         async inspect() { return { meta: { cwd: sessionCwd } } },
         async resolveAgent() { return { agent: parent } },
       },
+      decisions: trustedTestDecisions(),
     })
     runtime.registerProvider({ name: 'web-start-fixture', kind: 'command', traits: ['code-edit', 'local-workspace'], workspaceCwd: true, run: invoked })
     try {
@@ -1679,7 +1710,7 @@ describe('AutoDev end-to-end run', () => {
       },
     }, {
       commands: new FakeMavenExecutor(),
-      decisions: new DecisionCoordinator({ config: { mode: 'off' } }),
+      decisions: trustedTestDecisions(),
     })
     runtime.registerProvider({
       name: 'crashing-agent',
@@ -1853,7 +1884,7 @@ describe('AutoDev end-to-end run', () => {
       },
     }, {
       commands: new FakeMavenExecutor(),
-      decisions: new DecisionCoordinator({ config: { mode: 'off' } }),
+      decisions: trustedTestDecisions(),
     })
     runtime.registerProvider({
       name: 'fake-editor',
@@ -1942,7 +1973,7 @@ describe('AutoDev end-to-end run', () => {
       dataRoot: stateRoot, worktreeRoot, jev: { mode: 'off' },
       maven: { executable: 'fake-mvn', buildArgs: ['package'], testArgs: ['test'] },
       routes: { implement: { candidates: [{ kind: 'command', provider: 'drift-editor', traits: ['code-edit', 'local-workspace'] }], requiredTaskTraits: ['code-edit', 'local-workspace'] } },
-    }, { commands: new FakeMavenExecutor(), decisions: new DecisionCoordinator({ config: { mode: 'off' } }) })
+    }, { commands: new FakeMavenExecutor(), decisions: trustedTestDecisions() })
     runtime.registerProvider({
       name: 'drift-editor', kind: 'command', traits: ['code-edit', 'local-workspace'], workspaceCwd: true,
       run: async (request) => {
@@ -2058,7 +2089,7 @@ describe('AutoDev end-to-end run', () => {
       dataRoot: stateRoot, worktreeRoot, jev: { mode: 'off' },
       maven: { executable: 'fake-mvn', buildArgs: ['package'], testArgs: ['test'] },
       routes: { implement: { candidates: [{ kind: 'command', provider: 'evidence-editor', traits: ['code-edit', 'local-workspace'] }], requiredTaskTraits: ['code-edit', 'local-workspace'] } },
-    }, { commands: new FakeMavenExecutor(), decisions: new DecisionCoordinator({ config: { mode: 'off' } }) })
+    }, { commands: new FakeMavenExecutor(), decisions: trustedTestDecisions() })
     runtime.registerProvider({
       name: 'evidence-editor', kind: 'command', traits: ['code-edit', 'local-workspace'], workspaceCwd: true,
       run: async (request) => {
@@ -2102,7 +2133,7 @@ describe('AutoDev end-to-end run', () => {
     }
     const runtimes = Array.from({ length: 8 }, () => new AutoDevRuntime(
       new Context(), config,
-      { commands: new FakeMavenExecutor(), decisions: new DecisionCoordinator({ config: { mode: 'off' } }) },
+      { commands: new FakeMavenExecutor(), decisions: trustedTestDecisions() },
     ))
     const runtimeA = runtimes[0]
     if (runtimeA === undefined) throw new Error('promotion concurrency fixture did not create a Host')
@@ -2147,7 +2178,7 @@ describe('AutoDev end-to-end run', () => {
           requiredTaskTraits: ['code-edit', 'local-workspace'],
         },
       },
-    }, { commands: new FakeMavenExecutor(), decisions: new DecisionCoordinator({ config: { mode: 'off' } }) })
+    }, { commands: new FakeMavenExecutor(), decisions: trustedTestDecisions() })
     const startPath = join(workerRoot, 'start')
     const fixturePath = fileURLToPath(new URL('./fixtures/autodev-promotion-race.ts', import.meta.url))
     const workspaceRoot = fileURLToPath(new URL('../../../../', import.meta.url))
@@ -2620,7 +2651,7 @@ describe('AutoDev end-to-end run', () => {
       maven: { executable: 'fake-mvn', buildArgs: ['package'], testArgs: ['test'] },
       routes: { implement: { candidates: [{ kind: 'command' as const, provider: 'recovery-editor', traits: ['code-edit', 'local-workspace'] }], requiredTaskTraits: ['code-edit', 'local-workspace'] } },
     }
-    const runtime = new AutoDevRuntime(new Context(), config, { commands: new FakeMavenExecutor(), decisions: new DecisionCoordinator({ config: { mode: 'off' } }) })
+    const runtime = new AutoDevRuntime(new Context(), config, { commands: new FakeMavenExecutor(), decisions: trustedTestDecisions() })
     runtime.registerProvider({
       name: 'recovery-editor', kind: 'command', traits: ['code-edit', 'local-workspace'], workspaceCwd: true,
       run: async (request) => {
@@ -2687,7 +2718,7 @@ describe('AutoDev end-to-end run', () => {
     const runtime = new AutoDevRuntime(new Context(), {
       dataRoot: stateRoot, worktreeRoot, jev: { mode: 'off' },
       routes: { implement: { candidates: [{ kind: 'command', provider: 'node-editor', traits: ['code-edit', 'local-workspace'] }], requiredTaskTraits: ['code-edit', 'local-workspace'] } },
-    }, { commands, decisions: new DecisionCoordinator({ config: { mode: 'off' } }) })
+    }, { commands, decisions: trustedTestDecisions() })
     runtime.registerProvider({
       name: 'node-editor', kind: 'command', traits: ['code-edit', 'local-workspace'], workspaceCwd: true,
       run: async (request) => {
@@ -2728,7 +2759,7 @@ describe('AutoDev end-to-end run', () => {
           requiredTaskTraits: ['code-edit', 'local-workspace'],
         },
       },
-    }, { commands: new FakeMavenExecutor(), decisions: new DecisionCoordinator({ config: { mode: 'off' } }) })
+    }, { commands: new FakeMavenExecutor(), decisions: trustedTestDecisions() })
     const provider = vi.fn(async (request: Parameters<NonNullable<Parameters<typeof runtime.registerProvider>[0]['run']>>[0]) => {
       writeFileSync(join(request.cwd, 'UNEXPECTED.txt'), 'provider must not run\n')
       return { provider: request.provider, status: 'completed' as const, output: 'unexpected' }
@@ -2769,7 +2800,7 @@ describe('AutoDev end-to-end run', () => {
     const runtime = new AutoDevRuntime(new Context(), {
       dataRoot: stateRoot, worktreeRoot, jev: { mode: 'off' },
       routes: { implement: { candidates: [{ kind: 'command', provider: 'assumption-editor', traits: ['code-edit', 'local-workspace'] }], requiredTaskTraits: ['code-edit', 'local-workspace'] } },
-    }, { commands: new FakeMavenExecutor(), decisions: new DecisionCoordinator({ config: { mode: 'off' } }) })
+    }, { commands: new FakeMavenExecutor(), decisions: trustedTestDecisions() })
     const provider = vi.fn(async (request: Parameters<NonNullable<Parameters<typeof runtime.registerProvider>[0]['run']>>[0]) => {
       writeFileSync(join(request.cwd, 'SHOULD_NOT_RUN.txt'), 'blocked\n')
       return { provider: request.provider, status: 'completed' as const, output: 'unexpected execution' }
@@ -2816,7 +2847,7 @@ describe('AutoDev end-to-end run', () => {
           requiredTaskTraits: ['code-edit', 'local-workspace'],
         },
       },
-    }, { commands: new FakeMavenExecutor(), decisions: new DecisionCoordinator({ config: { mode: 'off' } }) })
+    }, { commands: new FakeMavenExecutor(), decisions: trustedTestDecisions() })
     const provider = vi.fn(async (request: Parameters<NonNullable<Parameters<typeof runtime.registerProvider>[0]['run']>>[0]) => {
       writeFileSync(join(request.cwd, 'REFUND_IMPLEMENTED.txt'), 'implemented\n')
       return { provider: request.provider, status: 'completed' as const, output: 'created refund fixture' }

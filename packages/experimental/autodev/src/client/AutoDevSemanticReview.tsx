@@ -70,7 +70,7 @@ export function AutoDevSemanticReview({ snapshot, remote, t, busy, onSnapshotAct
           const checkedEvidence = assumptionEvidence[assumption.id]
             ?? (assumption.evidenceIds ?? []).filter(id => evidence.some(item => item.id === id))
           const resolution = assumptionResolutions[assumption.id] ?? ''
-          return <div key={assumption.id} style={{ marginTop: 6, padding: 8, border: '1px solid #e5e7eb', borderRadius: 6 }}>
+          return <div key={assumption.id} style={{ marginTop: 6, padding: 10, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
             <p style={{ margin: '2px 0' }}><strong>{assumption.status}</strong> · {assumption.statement}</p>
             {assumption.rationale !== undefined && <small>{assumption.rationale}</small>}
             {assumption.resolution !== undefined && <p style={{ margin: '4px 0' }}>{t('resolution')}: {assumption.resolution}</p>}
@@ -121,7 +121,7 @@ export function AutoDevSemanticReview({ snapshot, remote, t, busy, onSnapshotAct
         ? <p style={{ margin: '4px 0' }}>{t('noUncertainties')}</p>
         : snapshot.uncertainties.map((uncertainty) => {
           const resolution = uncertaintyResolutions[uncertainty.id] ?? ''
-          return <div key={uncertainty.id} style={{ marginTop: 6, padding: 8, border: '1px solid #e5e7eb', borderRadius: 6 }}>
+          return <div key={uncertainty.id} style={{ marginTop: 6, padding: 10, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
             <p style={{ margin: '2px 0' }}><strong>{uncertainty.status}</strong> · {uncertainty.subject} ({uncertainty.severity})</p>
             <p style={{ margin: '4px 0' }}>{uncertainty.reason}</p>
             {uncertainty.alternatives.length > 0 && <ul style={{ margin: '4px 0', paddingLeft: 18 }}>{uncertainty.alternatives.map((item, index) => <li key={`${index}:${item}`}>{item}</li>)}</ul>}

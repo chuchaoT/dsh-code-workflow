@@ -9,11 +9,12 @@ kind: "package-bundle"
 
 ## 概述
 
-AutoDev 为 DeepSeek Harness Profile 增加可恢复的软件工程流程。它在 Git Worktree 中运行 Coding Agent，使用项目对应的 Build/Test Driver 检查变更，并要求显式批准后才将结果晋级到原始工作区。它复用 Harness 已加载的 Codex 和 Claude Code Provider，也允许通过注册契约添加其他 Provider。Host 持有权威持久状态；Sidebar 是受限客户端，不负责裁决执行或晋级。
+AutoDev 为 DeepSeek Harness Profile 增加可恢复的软件工程流程。它在 Git Worktree 中运行 Coding Agent，支持显式工程模式，并在可用时使用项目对应的 Build/Test Driver 检查变更；晋级到原始工作区前必须显式批准。它也支持没有首个提交、没有 Git 作者身份配置的真正空仓库。AutoDev 复用 Harness 已加载的 Codex 和 Claude Code Provider，也允许通过注册契约添加其他 Provider。Host 持有权威持久状态；Sidebar 是受限客户端，不负责裁决执行或晋级。
 
 ## 目录
 
 - [使用此包](#use-this-package)
+- [工作模式与执行环境](#work-modes-and-execution-environment)
 - [了解实现](#understand-the-implementation)
 - [公开 API 契约](#public-api-contracts)
 - [延伸阅读](#further-exploration)
@@ -48,11 +49,28 @@ pnpm dsh plugin --profile autodev remove @deepseek-ai/dsh-experimental-autodev
 - Git baseline 检查、每次尝试使用全新 Worktree、有界 Diff、漂移检测和受保护的晋级。
 - 规范化 Agent Protocol 和动态 ProviderRouter；内置的 `codex`、`claude-code`、`spawn` 路由使用 Harness 已加载的 Provider。
 - 识别根目录 Maven、Gradle、npm/pnpm/yarn/bun、pytest 项目并选择 Build/Test Driver，再将选择固化到 Plan。
+- 支持九种显式或自动识别的工作模式，并与 Run 生命周期状态分离；只读模式不要求构建驱动或代码 Candidate。
 - 按项目隔离的 Memory、Business Concept、Assumption、Semantic Uncertainty、版本化 Playbook 和基于证据的知识演化。
 - 用于 Run、Gate、检索、纠正、回归检查和压缩的模型工具；Web Sidebar 展示 Run 快照和受限 Candidate Diff，并可并排比较同一 Run 的两个版本及其验证证据。
-- 可选的 Jev 决策，支持 `required`、`advisory`、`off` 模式；Jev 不能覆盖失败的确定性 Build 或 Test 结果。
+- 可扩展的 Jev/本地决策 Provider 链，支持 `required`、`advisory`、`off` 模式；静态降级决策不能伪造 Review PASS，也不能覆盖失败的 Build/Test Evidence。
 
 Host 从经过检查的 Git 仓库派生项目 key。可选的 module、branch、language、project-version、schema-version、tech-stack-version 字段可缩小知识作用域；调用方不能通过这些字段将 Run 指向其他项目。
+
+### 扩展决策 Provider
+
+既有 `DecisionProvider` 契约可以扩展为本地模型或其他 Jev 兼容服务，无需替换路由器或 Jev HTTP 适配器。独立 DSH Bundle 可注册决策后端、指定优先级，并在卸载时撤销：
+
+```ts
+import type { DecisionProvider } from '@deepseek-ai/dsh-experimental-autodev'
+
+declare const ctx: { autodev: { registerDecisionProvider(id: string, provider: DecisionProvider, priority?: number): () => void } }
+declare const localModelAdapter: DecisionProvider
+
+const removeLocalModel = ctx.autodev.registerDecisionProvider('local-qwen', localModelAdapter, 20)
+// Bundle 卸载时调用 removeLocalModel()
+```
+
+优先级较高的 Provider 先运行；不可用、答案无效或低置信度（仅在配置阈值时）会继续尝试后续 Provider。`required` 模式在全部失败时中止，`advisory` 模式使用明确标记为不可信的静态兜底。只有真实模型决策才应返回 `source: 'jev'`；规则或静态适配器不能冒用。质量审查只有在分数达标且明确返回 `needs_review: false` 时才能生成 Review PASS。代码类 Run 的质量决策会附带最多 24,000 字节的 Candidate Diff；这可能包含私有源码，启用远程 Jev 前应确认数据处理边界。路径是否发送仍由 `sendPaths` 单独控制。除非显式配置置信度阈值，否则不会假设模型概率已经校准。该扩展点不会自动打包 Qwen 模型，也不会自动接通 DSH 的 Ollama Endpoint。
 
 ### 添加 Provider 或路由
 
@@ -162,11 +180,38 @@ OpenAI 兼容的模型端点可以复用 DSH 已有的 `@deepseek-ai/dsh-llm-pi-
 
 OpenAI 兼容客户端即使连接到忽略认证的本地 Ollama 服务，也要求传入一个 credential 值；应将占位凭据放入 DSH 凭据机制，不要写进被提交的 Profile。Ollama 和 FreeLLMAPI 提供的是模型推理，不会提供编码 Agent 所需的工作区工具、执行生命周期或 AutoDev Evidence。应通过 DSH Agent 组合运行 Ollama 模型（例如父 Session 使用 `ollama-local`，再由继承配置的 `spawn` 子 Agent 执行）；CodeBuddy 则是 ACP Agent 路由候选项。路由扩展点已存在，但真实服务端点和 Agent 全链路仍属于发布验收项。
 
+<a id="work-modes-and-execution-environment"></a>
+### 工作模式与执行环境
+
+工作模式回答“本次 Run 采用什么工程策略”；工作流状态回答“Run 当前处于生命周期哪一步”；执行环境回答“工作实际发生在哪里”。三者是不同层次。
+
+| 工作模式 | 目的 | 默认计划结构 |
+| --- | --- | --- |
+| `EXPLORE` | 了解仓库结构与行为 | 只读 Agent 分析 |
+| `IMPACT` | 追踪依赖关系和变更影响 | 只读 Agent 分析 |
+| `DEV` | 实现常规需求 | 实现 → 可选 Build → 可选 Test → Jev 质量审查 |
+| `DEBUG` | 定位根因、修复并回归 | 修复 → 可选 Build/Test → 质量审查 |
+| `DATABASE` | 安全处理 Schema/Migration | 实现 → 可选 Build/Test → 质量审查 |
+| `REFACTOR` | 保持行为兼容地重构 | 实现 → 可选 Build/Test → 质量审查 |
+| `TEST` | 补充测试并运行回归 | 编写测试 → 可选 Build/Test → 质量审查 |
+| `REVIEW` | 不修改文件，报告具体问题 | 结构化只读审查 |
+| `RELEASE` | 不修改文件，评估发布准备度 | 只读发布分析 |
+
+Sidebar 提供 `AUTO` 和所有显式模式。显式选择始终优先；自动分类是确定性的，无法判断时默认为 `DEV`。新 Run 会持久化解析后的模式及其来源（显式或自动）。没有这些字段的旧 Run 按 `DEV` 解释。`EXECUTING`、`BUILDING`、`TESTING`、`VERIFY` 等仍然是生命周期状态，不是模式。
+
+目前唯一支持的执行环境是 `LOCAL_WORKTREE`（由 Host 管理的 Git Worktree）；Docker、远程沙箱和 Agent Substrate 尚未实现。Worktree 可以隔离变更与原始工作区，但不是操作系统沙箱。只读模式要求路由声明 `read-only`，并在 Git 观察到 Worktree 变更时失败或进入闸门；这不能限制 Worktree 之外的任意副作用。
+
+#### 从空 Git 仓库开始
+
+仅当当前分支尚无提交且工作区真正为空（包含没有 ignored 文件）时，AutoDev 才接受 unborn 仓库。它会在仓库对象库中创建一个私有合成基线提交对象，以便 Git Worktree 和补丁操作；该对象不会设置为分支/HEAD 提交，不会修改全局或本地 Git 作者配置，也不会改动用户索引。没有受支持根目录驱动时会省略 Build/Test 阶段，并在 Environment Evidence 中明确警告。进入 `VERIFY` 之前仍要求模型支持的审查通过；晋级时仅将 Candidate 补丁写成普通未跟踪文件，原分支仍然没有提交。如果你希望以提交作为基线，请先自行创建首个提交。
+
+`EXPLORE`、`IMPACT`、`REVIEW` 和 `RELEASE` 各执行一个只读 Agent 任务，不创建代码 Candidate，也不要求 Build/Test Driver。Review 输出必须是包含 `verdict` 和 `findings` 的严格 JSON；格式无效时保持 `WARN` 并打开 Human Gate。Worktree 和执行审计仍会保留。
+
 ### 安全地运行与晋级
 
 常规流程会阻止未经验证的改动进入原始工作区：
 
-1. 从干净的 Git 仓库创建 DRAFT Run；AutoDev 记录 baseline 和不可变 Plan。
+1. 从干净的已提交仓库或真正空的 unborn 仓库创建 DRAFT Run；AutoDev 记录 baseline、解析后的工作模式、执行环境和不可变 Plan。
 2. 在侧栏审阅 Plan 与验收标准，再显式批准该版本 Plan。未批准时 `autodev_run` 会拒绝启动；Replan 后须重新批准。
 3. 从有活动父 Agent 的 DSH 会话中运行本次尝试，在托管 Worktree 中收集 Build、Test、Verification 和副作用 Evidence。侧栏目前不能直接启动需要父 Agent 的官方 Subagent Provider。
 4. 审阅 Human Gate、过期 baseline、失败检查、未解决的不确定性或未知外部结果；AutoDev 不会自动重试结果未知的副作用。

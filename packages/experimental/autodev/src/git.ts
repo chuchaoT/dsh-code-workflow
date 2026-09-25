@@ -54,14 +54,32 @@ export class GitManager {
     const repoRoot = resolve(rootResult.stdout.trim())
     const [head, status] = await Promise.all([
       this.commands.run(['git', 'rev-parse', 'HEAD'], repoRoot, { signal }),
-      this.commands.run(['git', 'status', '--porcelain=v1'], repoRoot, { signal }),
+      this.commands.run(['git', 'status', '--porcelain=v1', '--untracked-files=all'], repoRoot, { signal }),
     ])
-    if (head.exitCode !== 0) throw new Error(`cannot read Git HEAD: ${head.stderr.trim()}`)
+    if (status.exitCode !== 0) throw new Error(`cannot inspect Git status: ${status.stderr.trim()}`)
     const lines = status.stdout.split(/\r?\n/).filter(Boolean)
+    if (head.exitCode !== 0) {
+      const symbolicHead = await this.commands.run(['git', 'symbolic-ref', '--quiet', 'HEAD'], repoRoot, { signal })
+      const ignored = await this.commands.run(['git', 'status', '--porcelain=v1', '--untracked-files=all', '--ignored'], repoRoot, { signal })
+      if (symbolicHead.exitCode !== 0 || ignored.exitCode !== 0 || ignored.stdout.trim() !== '') {
+        throw new Error(`cannot read Git HEAD: ${head.stderr.trim()}`)
+      }
+      const baseCommit = await this.createSyntheticBaseline(repoRoot, signal)
+      return {
+        repoPath: requested,
+        repoRoot,
+        baseCommit,
+        kind: 'unborn',
+        clean: true,
+        status: [],
+        capturedAt: new Date().toISOString(),
+      }
+    }
     return {
       repoPath: requested,
       repoRoot,
       baseCommit: head.stdout.trim(),
+      kind: 'commit',
       clean: lines.length === 0,
       status: lines,
       capturedAt: new Date().toISOString(),
@@ -156,10 +174,23 @@ export class GitManager {
     patchPath: string,
     expectedTreeHash: string,
     signal?: AbortSignal,
+    baselineKind: 'commit' | 'unborn' = 'commit',
   ): Promise<GitPromotionOutcome> {
-    const head = await this.currentHead(repoRoot, signal)
-    if (head !== baseCommit) {
-      throw new GitPromotionError(`target repository drifted from ${baseCommit} to ${head}`, 'conflict')
+    const headResult = await this.commands.run(['git', 'rev-parse', 'HEAD'], repoRoot, { signal })
+    if (baselineKind === 'unborn') {
+      if (headResult.exitCode === 0) {
+        throw new GitPromotionError(`target repository gained commit ${headResult.stdout.trim()} after its unborn baseline`, 'conflict')
+      }
+      const symbolicHead = await this.commands.run(['git', 'symbolic-ref', '--quiet', 'HEAD'], repoRoot, { signal })
+      if (symbolicHead.exitCode !== 0) throw new GitPromotionError('target repository no longer has its original unborn branch', 'conflict')
+      const ignored = await this.commands.run(['git', 'status', '--porcelain=v1', '--untracked-files=all', '--ignored'], repoRoot, { signal })
+      if (ignored.exitCode !== 0 || ignored.stdout.split(/\r?\n/).some(line => line.startsWith('!!'))) {
+        throw new GitPromotionError('unborn target repository contains ignored files or its status cannot be verified', 'conflict')
+      }
+    } else {
+      if (headResult.exitCode !== 0) throw new GitPromotionError(`cannot read target Git HEAD: ${headResult.stderr.trim()}`, 'conflict')
+      const head = headResult.stdout.trim()
+      if (head !== baseCommit) throw new GitPromotionError(`target repository drifted from ${baseCommit} to ${head}`, 'conflict')
     }
 
     const observedTree = await this.workingTreeHash(repoRoot, baseCommit, signal)
@@ -190,6 +221,32 @@ export class GitManager {
         : `git apply left a repository state that does not match the sealed candidate: ${result.stderr.trim() || result.stdout.trim()}`,
       'unknown',
     )
+  }
+
+  /** Write an unreachable baseline commit for a genuinely empty unborn repository.
+   * The operation writes Git objects only: it does not move HEAD, create a branch,
+   * stage files in the user's index, or modify global Git identity configuration.
+   */
+  private async createSyntheticBaseline(repoRoot: string, signal?: AbortSignal): Promise<string> {
+    const tempRoot = resolve(mkdtempSync(join(tmpdir(), 'dsh-autodev-index-')))
+    try {
+      const indexPath = resolve(tempRoot, 'index')
+      const options = { signal, env: { GIT_INDEX_FILE: indexPath } }
+      const readTree = await this.commands.run(['git', 'read-tree', '--empty'], repoRoot, options)
+      if (readTree.exitCode !== 0) throw new Error(`cannot initialize temporary empty Git index: ${readTree.stderr.trim()}`)
+      const tree = await this.commands.run(['git', 'write-tree'], repoRoot, options)
+      if (tree.exitCode !== 0) throw new Error(`cannot write empty Git tree: ${tree.stderr.trim()}`)
+      const commit = await this.commands.run([
+        'git', '-c', 'user.name=DSH AutoDev', '-c', 'user.email=autodev@localhost',
+        'commit-tree', tree.stdout.trim(), '-m', 'DSH AutoDev synthetic unborn baseline',
+      ], repoRoot, { signal })
+      if (commit.exitCode !== 0 || commit.stdout.trim() === '') {
+        throw new Error(`cannot create private baseline commit: ${commit.stderr.trim() || commit.stdout.trim()}`)
+      }
+      return commit.stdout.trim()
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
   }
 
   private async workingTreeHash(repoRoot: string, baseCommit: string, signal?: AbortSignal): Promise<string> {

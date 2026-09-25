@@ -225,7 +225,7 @@ export function AutoDevKnowledgeLifecycle({ snapshot, remote, t, busy, onSnapsho
 
   return <section aria-labelledby="autodev-knowledge-lifecycle-title" style={{ display: 'grid', gap: 8 }}>
     <h4 id="autodev-knowledge-lifecycle-title" style={{ margin: '4px 0 0', fontSize: 13 }}>{t('knowledgeLifecycle')}</h4>
-    <p style={{ margin: '2px 0', color: '#6b7280' }}>{t('knowledgeLifecycleNotice')}</p>
+    <p style={{ margin: '2px 0', color: 'var(--dsw-alias-label-tertiary, #707784)' }}>{t('knowledgeLifecycleNotice')}</p>
 
     <section aria-labelledby="autodev-knowledge-regression-title" style={{ display: 'grid', gap: 6 }}>
       <h5 id="autodev-knowledge-regression-title" style={{ margin: '4px 0 0' }}>{t('knowledgeRegression')}</h5>
@@ -297,11 +297,11 @@ export function AutoDevKnowledgeLifecycle({ snapshot, remote, t, busy, onSnapsho
           const hasEvidence = draft.evidenceIds.length > 0 || candidate.evidenceIds.length > 0
           const expired = candidate.expiresAt !== undefined && Date.parse(candidate.expiresAt) <= Date.now()
           const canPromote = scopeMatches && !expired && hasEvidence && selectedCase !== undefined && currentSuitePass
-          return <article key={candidate.id} style={{ padding: 8, border: '1px solid #e5e7eb', borderRadius: 6 }}>
+          return <article key={candidate.id} style={{ padding: 10, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
             <p style={{ margin: '2px 0' }}><strong>{candidate.statement}</strong></p>
-            <p style={{ margin: '2px 0', color: '#6b7280' }}>{candidate.id} · {candidate.status} · v{candidate.version} · {t('knowledgeEvidenceAttached')}: {candidate.evidenceIds.join(', ') || '—'}</p>
-            {!scopeMatches && <p style={{ margin: '2px 0', color: '#92400e' }}>{t('promotionScopeMismatch')}</p>}
-            {expired && <p style={{ margin: '2px 0', color: '#92400e' }}>{t('knowledgeExpired')}</p>}
+            <p style={{ margin: '2px 0', color: 'var(--dsw-alias-label-tertiary, #707784)' }}>{candidate.id} · {candidate.status} · v{candidate.version} · {t('knowledgeEvidenceAttached')}: {candidate.evidenceIds.join(', ') || '—'}</p>
+            {!scopeMatches && <p style={{ margin: '2px 0', color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('promotionScopeMismatch')}</p>}
+            {expired && <p style={{ margin: '2px 0', color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('knowledgeExpired')}</p>}
             <fieldset style={{ margin: '6px 0', padding: 6 }} disabled={busy || !scopeMatches || expired}>
               <legend>{t('promotionEvidence')}</legend>
               {eligibleEvidence.length === 0
@@ -339,7 +339,7 @@ export function AutoDevKnowledgeLifecycle({ snapshot, remote, t, busy, onSnapsho
                 })}
               </select>
             </label>
-            {!currentSuitePass && <p style={{ margin: '2px 0', color: '#92400e' }}>{t('promotionNeedsFreshSuite')}</p>}
+            {!currentSuitePass && <p style={{ margin: '2px 0', color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('promotionNeedsFreshSuite')}</p>}
             <label style={{ display: 'flex', gap: 6, alignItems: 'baseline', marginTop: 6 }}>
               <input type="checkbox" checked={draft.confirmed} onChange={event => updatePromotion(candidate.id, { confirmed: event.currentTarget.checked })} disabled={busy || !canPromote} />
               <span>{t('confirmKnowledgePromotion')}</span>
@@ -352,8 +352,8 @@ export function AutoDevKnowledgeLifecycle({ snapshot, remote, t, busy, onSnapsho
     <section aria-labelledby="autodev-knowledge-compaction-title" style={{ display: 'grid', gap: 6 }}>
       <h5 id="autodev-knowledge-compaction-title" style={{ margin: '4px 0 0' }}>{t('knowledgeCompaction')}</h5>
       <p style={{ margin: '2px 0' }}>{t('compactionPreview')}: {duplicateGroupCount(exactRecords)} · {t('knowledgeDuplicateGroups')}</p>
-      <p style={{ margin: '2px 0', color: '#6b7280' }}>{t('compactionNotice')}</p>
-      {compactArmed && <p role="status" style={{ margin: '2px 0', color: '#92400e' }}>{t('confirmCompactionNotice')}</p>}
+      <p style={{ margin: '2px 0', color: 'var(--dsw-alias-label-tertiary, #707784)' }}>{t('compactionNotice')}</p>
+      {compactArmed && <p role="status" style={{ margin: '2px 0', color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('confirmCompactionNotice')}</p>}
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         <button type="button" disabled={busy} onClick={startCompaction}>{compactArmed ? t('confirmCompactKnowledge') : t('compactKnowledge')}</button>
         {compactArmed && <button type="button" disabled={busy} onClick={() => { setCompactArmed(false) }}>{t('cancelKnowledgeAction')}</button>}
@@ -368,7 +368,7 @@ export function AutoDevKnowledgeLifecycle({ snapshot, remote, t, busy, onSnapsho
             : report.snapshots.length === 0
               ? t('compactionNoChanges')
               : restorable ? t('compactionRestorable') : t('compactionStale')
-          return <article key={report.id} style={{ padding: 8, border: '1px solid #e5e7eb', borderRadius: 6 }}>
+          return <article key={report.id} style={{ padding: 10, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
             <p style={{ margin: '2px 0' }}><strong>{report.id}</strong> · {status}</p>
             <p style={{ margin: '2px 0' }}>{t('compactionCounts')}: {report.inputIds.length} → {report.outputIds.length} · {report.actions.length} {t('compactionActions')}</p>
             <details>
@@ -377,7 +377,7 @@ export function AutoDevKnowledgeLifecycle({ snapshot, remote, t, busy, onSnapsho
                 {action.kind}: {action.inputIds.join(', ')}{action.outputId === undefined ? '' : ` → ${action.outputId}`} — {action.reason}
               </li>)}</ul>
             </details>
-            {armed && <p role="status" style={{ margin: '2px 0', color: '#92400e' }}>{t('confirmRestoreNotice')}</p>}
+            {armed && <p role="status" style={{ margin: '2px 0', color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('confirmRestoreNotice')}</p>}
             <button type="button" disabled={busy || !restorable} onClick={() => { restoreCompaction(report) }}>
               {armed ? t('confirmRestoreCompaction') : t('restoreCompaction')}
             </button>

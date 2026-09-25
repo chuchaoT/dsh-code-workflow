@@ -50,7 +50,7 @@ function ConceptCorrectionCard({ concept, t, busy, onCorrect }: {
   const required = [draft.name, draft.definition, draft.target, draft.effect, draft.evidenceSummary, draft.resolution]
     .every(value => value.trim() !== '')
 
-  return <article style={{ marginTop: 6, padding: 8, border: '1px solid #e5e7eb', borderRadius: 6 }}>
+  return <article style={{ marginTop: 6, padding: 10, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
     <p style={{ margin: '2px 0' }}><strong>{concept.name}</strong> · {concept.key} · v{concept.version} · {concept.status}</p>
     <p style={{ margin: '4px 0' }}>{concept.definition}</p>
     <p style={{ margin: '4px 0' }}>{t('conceptTarget')}: {concept.target} · {t('conceptEffect')}: {concept.effect}</p>
@@ -137,7 +137,7 @@ export function AutoDevKnowledgeReview({ snapshot, remote, t, busy, onSnapshotAc
         ? <p style={{ margin: '4px 0' }}>{t('noKnowledgeMerges')}</p>
         : snapshot.knowledgeMergeProposals.map((proposal) => {
           const draft = draftFor(proposal.id)
-          return <article key={proposal.id} style={{ marginTop: 6, padding: 8, border: '1px solid #e5e7eb', borderRadius: 6 }}>
+          return <article key={proposal.id} style={{ marginTop: 6, padding: 10, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
             <p style={{ margin: '2px 0' }}><strong>{proposal.status}</strong> · {proposal.kind} · {Math.round(proposal.similarity * 100)}%</p>
             <p style={{ margin: '4px 0' }}>{proposal.reason}</p>
             <p style={{ margin: '4px 0' }}>{t('sharedTerms')}: {proposal.sharedTerms.join(', ') || '—'}</p>

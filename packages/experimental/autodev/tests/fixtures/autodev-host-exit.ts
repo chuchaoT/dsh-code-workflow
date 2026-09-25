@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import LocalSubprocessRuntime from '../../../../subprocess/subprocess-local/src/index.ts'
 import { HarnessCommandExecutor, type CommandExecutor } from '../../src/command.ts'
 import { AutoDevRuntime } from '../../src/runtime.ts'
+import { trustedTestDecisions } from '../harness.ts'
 
 const [repoPath, dataRoot, worktreeRoot, startedPath, readyPath, failurePath, requestedStage, requestedEffectUrl] = process.argv.slice(2)
 if ([repoPath, dataRoot, worktreeRoot, startedPath, readyPath, failurePath].some(value => value === undefined)) {
@@ -63,7 +64,7 @@ const runtime = new AutoDevRuntime(ctx, {
       requiredTaskTraits: ['code-edit', 'local-workspace'],
     },
   },
-}, stage === 'promotion' ? { commands: promotionCommands } : {})
+}, stage === 'promotion' ? { commands: promotionCommands, decisions: trustedTestDecisions() } : {})
 runtime.registerProvider({
   name: 'host-exit-fixture',
   kind: 'command',

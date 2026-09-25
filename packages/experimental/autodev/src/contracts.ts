@@ -38,6 +38,7 @@ export type EvidenceType =
   | 'BUILD'
   | 'TEST'
   | 'REVIEW'
+  | 'ANALYSIS'
   | 'JEV_DECISION'
   | 'DRIFT'
   | 'PROMOTION'
@@ -87,6 +88,23 @@ export interface ProviderInfo {
 
 /** Decision options for recovering from an execution failure. */
 export type FailureAction = 'retry_same' | 'rework' | 'replan' | 'human' | 'stop'
+
+/** Engineering intent selected for one AutoDev Run; it is distinct from workflow state. */
+export type AutoDevMode = 'EXPLORE' | 'IMPACT' | 'DEV' | 'DEBUG' | 'DATABASE' | 'REFACTOR' | 'TEST' | 'REVIEW' | 'RELEASE'
+
+/** How the Run's engineering intent was selected. */
+export type AutoDevModeSource = 'explicit' | 'auto'
+
+/** Repository starting point observed when a Run was created. */
+export type RepositoryBaselineKind = 'commit' | 'unborn'
+
+/** Execution location/security contract; MVP supports only Host-managed local Git Worktrees. */
+export type ExecutionEnvironmentKind = 'LOCAL_WORKTREE'
+
+/** Frozen execution boundary selected separately from the engineering work mode. */
+export interface ExecutionEnvironmentSpec {
+  readonly kind: ExecutionEnvironmentKind
+}
 
 /** One Provider choice considered by a named route. */
 export interface RouteCandidate {
@@ -196,6 +214,8 @@ export interface RepositoryBaseline {
   readonly repoPath: string
   readonly repoRoot: string
   readonly baseCommit: string
+  /** `unborn` means the baseline is a private synthetic commit; the original branch remains unborn. */
+  readonly kind?: RepositoryBaselineKind
   readonly clean: boolean
   readonly status: readonly string[]
   readonly capturedAt: string
@@ -210,6 +230,13 @@ export interface Run {
   readonly acceptanceCriteria: readonly string[]
   readonly status: RunStatus
   readonly baseCommit: string
+  /** Missing on legacy Runs, which are interpreted as DEV over a committed baseline. */
+  readonly mode?: AutoDevMode
+  readonly modeSource?: AutoDevModeSource
+  /** Missing on legacy Runs; they execute in the Host-managed local Worktree. */
+  readonly executionEnvironment?: ExecutionEnvironmentSpec
+  /** Missing on legacy Runs, which are interpreted as ordinary committed repositories. */
+  readonly baselineKind?: RepositoryBaselineKind
   readonly repoRoot: string
   /** Stable project scope; defaults to the normalized repository root. */
   readonly projectKey?: string
@@ -239,7 +266,7 @@ export interface Run {
 /** One ordered task node in an immutable Plan version. */
 export interface PlanNode {
   readonly id: string
-  readonly kind: 'implement' | 'build' | 'test' | 'review'
+  readonly kind: 'implement' | 'build' | 'test' | 'review' | 'analyze' | 'impact' | 'release'
   readonly description: string
   readonly dependencies: readonly string[]
   readonly expectedOutputs: readonly string[]
@@ -255,6 +282,8 @@ export interface PlanVersion {
   readonly parentId?: string
   readonly status: 'ACTIVE' | 'SUPERSEDED' | 'CANCELLED'
   readonly fingerprint: string
+  /** Missing on legacy Plans; the owning Run's mode is authoritative. */
+  readonly mode?: AutoDevMode
   readonly nodes: readonly PlanNode[]
   /** Deterministic build/test driver selected from the inspected project root. */
   readonly buildDriverId?: BuildDriverId
@@ -677,7 +706,7 @@ export interface SideEffectRecord {
 }
 
 /** Deterministic verification check category for a Run Candidate. */
-export type VerificationCheckKind = 'baseline' | 'build' | 'test' | 'review' | 'side-effect'
+export type VerificationCheckKind = 'baseline' | 'build' | 'test' | 'review' | 'analysis' | 'side-effect'
 
 /** A deterministic acceptance condition owned by the Runtime, not by an Agent. */
 export interface VerificationCheck {
@@ -739,6 +768,8 @@ export interface JevDecision {
   readonly stateHash: string
   readonly questionSetVersion: string
   readonly source: 'jev' | 'static' | 'fallback'
+  /** Optional stable provider identifier for Jev/local-model extension adapters. */
+  readonly providerId?: string
   readonly modelVersion: string
   readonly answer: readonly DecisionAnswer[]
   readonly probability?: number
@@ -971,6 +1002,10 @@ export interface CreateRunRequest {
   readonly request: string
   readonly acceptanceCriteria?: readonly string[]
   readonly goalId?: string
+  /** Explicit engineering mode; `AUTO` or omission enables deterministic intent classification. */
+  readonly mode?: AutoDevMode | 'AUTO'
+  /** Currently `LOCAL_WORKTREE` only; omitted requests use that safe default. */
+  readonly executionEnvironment?: ExecutionEnvironmentSpec
   /** Optional explicit driver for a repository containing multiple project markers. */
   readonly buildDriver?: BuildDriverId
   /** Additional scope dimensions; projectKey is always bound to the inspected repository. */
@@ -1029,6 +1064,8 @@ export interface DecisionAnswer {
 /** Normalized Jev decision result consumed by Host policy. */
 export interface DecisionResult {
   readonly source: 'jev' | 'static' | 'fallback'
+  /** Optional provider identity; older providers may omit it. */
+  readonly providerId?: string
   readonly modelVersion: string
   readonly answers: readonly DecisionAnswer[]
   readonly raw?: unknown

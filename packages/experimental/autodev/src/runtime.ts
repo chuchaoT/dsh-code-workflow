@@ -48,9 +48,9 @@ import type {
   VerificationReport,
 } from './contracts.ts'
 import { HarnessCommandExecutor, type CommandExecutor, type CommandResult } from './command.ts'
-import { commandForDriver, selectBuildDriver, type DriverSettings } from './drivers.ts'
+import { commandForDriver, detectBuildDrivers, selectBuildDriver, type DriverSettings } from './drivers.ts'
 import { GitManager, GitPromotionError, GitWorktreeCleanupError } from './git.ts'
-import { answerOf, DecisionCoordinator, JevUnavailableError } from './jev.ts'
+import { answerOf, DecisionCoordinator, JevUnavailableError, type DecisionProvider } from './jev.ts'
 import { ProviderRouter, type CustomProvider } from './router.ts'
 import { AgentProtocol, isValidAgentSignalEnvelope, MAX_AGENT_CONTEXT_CHARS, normalizeSignal, type AutoDevAgentContext, type AgentSignalEnvelope, type AgentTask } from './protocol.ts'
 import { AutoDevStore, defaultDataRoot } from './store.ts'
@@ -63,6 +63,7 @@ import { SemanticService } from './semantics.ts'
 import { idempotencyKey, SideEffectService } from './side-effects.ts'
 import { normalizeScope, sameScope, scopeApplies } from './scope.ts'
 import { previewAutoDevRetention, resolveRetentionCleanupTarget } from './retention.ts'
+import { createModePlanNodes, isReadOnlyMode, modeTaskInstruction, resolveAutoDevMode } from './mode.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -96,7 +97,7 @@ interface ActiveRunOperation {
 const ALLOWED_TRANSITIONS: Readonly<Record<RunStatus, readonly RunStatus[]>> = {
   DRAFT: ['READY', 'CANCELLED'],
   READY: ['EXECUTING', 'PAUSED', 'CANCELLED', 'REWORK_REQUESTED', 'NEEDS_INTERVENTION'],
-  EXECUTING: ['BUILDING', 'FAILED', 'NEEDS_INTERVENTION', 'PAUSED', 'CANCELLED'],
+  EXECUTING: ['BUILDING', 'TESTING', 'VERIFY', 'FAILED', 'NEEDS_INTERVENTION', 'PAUSED', 'CANCELLED'],
   BUILDING: ['TESTING', 'FAILED', 'NEEDS_INTERVENTION', 'PAUSED', 'CANCELLED'],
   TESTING: ['VERIFY', 'FAILED', 'NEEDS_INTERVENTION', 'PAUSED', 'CANCELLED'],
   VERIFY: ['PROMOTING', 'REWORK_REQUESTED', 'NEEDS_INTERVENTION', 'CANCELLED', 'ABANDONED'],
@@ -1108,21 +1109,36 @@ export class AutoDevRuntime extends TypertRemoteService {
    * @returns The new Run's authoritative snapshot.
    */
   async create(request: CreateRunRequest, signal?: AbortSignal): Promise<AutoDevSnapshot> {
+    const requestText = requireText(request.request, 'request')
     const baseline = await this.git.inspect(request.repoPath, signal)
     if (!baseline.clean) {
       throw new Error(`target repository has uncommitted changes; AutoDev requires a clean baseline:\n${baseline.status.join('\n')}`)
     }
-    const buildDriverId = selectBuildDriver(baseline.repoRoot, request.buildDriver ?? this.config.buildDriver)
+    const selectedMode = resolveAutoDevMode(request.mode, requestText)
+    const configuredDriver = request.buildDriver ?? this.config.buildDriver
+    const detectedDrivers = detectBuildDrivers(baseline.repoRoot)
+    const mayOmitDriver = isReadOnlyMode(selectedMode.mode) || (baseline.kind === 'unborn' && detectedDrivers.length === 0 && configuredDriver === 'auto')
+    const buildDriverId = mayOmitDriver && configuredDriver === 'auto'
+      ? undefined
+      : selectBuildDriver(baseline.repoRoot, configuredDriver)
+    const environmentSpec = request.executionEnvironment ?? { kind: 'LOCAL_WORKTREE' as const }
+    if (typeof environmentSpec !== 'object' || environmentSpec === null || environmentSpec.kind !== 'LOCAL_WORKTREE') {
+      throw new Error(`unsupported execution environment: ${String(environmentSpec?.kind)}`)
+    }
     const id = randomUUID()
     const now = new Date().toISOString()
     const run: Run = {
       schemaVersion: 1,
       id,
       repoPath: baseline.repoRoot,
-      request: requireText(request.request, 'request'),
+      request: requestText,
       acceptanceCriteria: (request.acceptanceCriteria ?? []).map(item => requireText(item, 'acceptance criterion')),
       status: 'DRAFT',
       baseCommit: baseline.baseCommit,
+      mode: selectedMode.mode,
+      modeSource: selectedMode.source,
+      baselineKind: baseline.kind ?? 'commit',
+      executionEnvironment: environmentSpec,
       repoRoot: baseline.repoRoot,
       projectKey: baseline.repoRoot,
       scope: normalizeScope({ projectKey: baseline.repoRoot, ...request.scope }),
@@ -1151,15 +1167,15 @@ export class AutoDevRuntime extends TypertRemoteService {
         runId: id,
         type: 'REPOSITORY_BASELINE',
         status: 'PASS',
-        summary: `Clean baseline ${baseline.baseCommit} at ${baseline.repoRoot}`,
+        summary: `${baseline.kind === 'unborn' ? 'Empty unborn baseline' : 'Clean baseline'} ${baseline.baseCommit} at ${baseline.repoRoot}`,
         createdAt: now,
       })
       this.store.saveEvidence({
         id: randomUUID(),
         runId: id,
         type: 'ENVIRONMENT',
-        status: 'PASS',
-        summary: `Host ${process.platform}/${process.arch}, Node ${process.version}`,
+        status: buildDriverId === undefined && !isReadOnlyMode(selectedMode.mode) ? 'WARN' : 'PASS',
+        summary: `Host ${process.platform}/${process.arch}, Node ${process.version}${buildDriverId === undefined && !isReadOnlyMode(selectedMode.mode) ? '; no deterministic Build/Test driver detected' : ''}`,
         environment,
         createdAt: new Date().toISOString(),
       })
@@ -1189,6 +1205,16 @@ export class AutoDevRuntime extends TypertRemoteService {
    */
   registerProvider(provider: Parameters<ProviderRouter['register']>[0]): () => void {
     return this.router.register(provider)
+  }
+
+  /** Register a reversible local-model or Jev-compatible decision backend.
+   * @param id Stable provider identifier for audit records.
+   * @param provider Typed decision adapter.
+   * @param priority Higher values are tried before the configured default Jev endpoint.
+   * @returns Disposer that removes only this exact registration.
+   */
+  registerDecisionProvider(id: string, provider: DecisionProvider, priority: number = 0): () => void {
+    return this.decisions.registerProvider(id, provider, priority)
   }
 
   /** Add a candidate backed by a Provider already loaded by Harness, such as an ACP subagent.
@@ -1272,6 +1298,7 @@ export class AutoDevRuntime extends TypertRemoteService {
           repoPath: run.repoPath,
           repoRoot: run.repoRoot,
           baseCommit: run.baseCommit,
+          kind: run.baselineKind ?? 'commit',
           clean: true,
           status: [],
           capturedAt: run.createdAt,
@@ -1283,11 +1310,15 @@ export class AutoDevRuntime extends TypertRemoteService {
       this.transition(run.id, 'EXECUTING', { attempt: run.attempt + 1, lastError: undefined, currentGateId: undefined })
       await this.executeImplementation(run.id, worktreePath, parentAgent, operationSignal)
       operationSignal.throwIfAborted()
-      await this.executeBuild(run.id, worktreePath, operationSignal)
-      operationSignal.throwIfAborted()
-      await this.executeTest(run.id, worktreePath, operationSignal)
-      operationSignal.throwIfAborted()
-      if (!await this.executeQuality(run.id, operationSignal)) return this.snapshot(run.id)
+      if (plan.nodes.some(node => node.kind === 'build')) {
+        await this.executeBuild(run.id, worktreePath, operationSignal)
+        operationSignal.throwIfAborted()
+      }
+      if (plan.nodes.some(node => node.kind === 'test')) {
+        await this.executeTest(run.id, worktreePath, operationSignal)
+        operationSignal.throwIfAborted()
+      }
+      if (!isReadOnlyMode(run.mode ?? 'DEV') && !await this.executeQuality(run.id, operationSignal)) return this.snapshot(run.id)
       operationSignal.throwIfAborted()
       await this.executeCompletion(run.id, operationSignal)
       return this.snapshot(run.id)
@@ -1494,7 +1525,7 @@ export class AutoDevRuntime extends TypertRemoteService {
       this.sideEffects.authorize(intent.id, approvedGateId === undefined ? 'explicit promote operation' : `Human Gate ${approvedGateId} explicitly approved promote`, actor)
       this.sideEffects.start(intent.id)
       sideEffectStarted = true
-      const outcome = await this.git.promote(run.repoRoot, run.baseCommit, patchArtifact.path, candidate.gitTreeHash, signal)
+      const outcome = await this.git.promote(run.repoRoot, run.baseCommit, patchArtifact.path, candidate.gitTreeHash, signal, run.baselineKind ?? 'commit')
       const evidence = {
         id: randomUUID(), runId, candidateId: candidate.id, planId: candidate.planId, attempt: candidate.attempt,
         gitTreeHash: candidate.gitTreeHash, type: 'PROMOTION', status: 'PASS',
@@ -1595,18 +1626,22 @@ export class AutoDevRuntime extends TypertRemoteService {
   private async executeImplementation(runId: string, worktreePath: string, parentAgent: unknown, signal: AbortSignal): Promise<void> {
     const run = this.requireRun(runId)
     const plan = this.activePlan(run)
+    const mode = run.mode ?? 'DEV'
+    const readOnly = isReadOnlyMode(mode)
     this.assertSemanticPlanReady(run, plan)
-    const node = plan.nodes.find(item => item.kind === 'implement')
-    if (node === undefined) throw new Error('active plan has no implement node')
+    const node = plan.nodes.find(item => item.kind !== 'build' && item.kind !== 'test')
+    if (node === undefined) throw new Error('active plan has no Agent task node')
     const execution = this.beginNode(run, plan, node)
-    const selection = await this.router.select(runId, node.id, 'agent-route', node.routeName ?? 'implement', {
+    const selection = await this.router.select(runId, node.id, 'agent-route', node.routeName ?? (readOnly ? 'review' : 'implement'), {
       request: run.request,
+      mode,
       acceptanceCriteria: run.acceptanceCriteria,
       availableProviders: this.router.list(),
-    }, ['code-edit', 'local-workspace'], signal)
+    }, readOnly ? ['read-only'] : ['code-edit', 'local-workspace'], signal)
     if (selection.candidate === undefined) {
-      this.failNode(execution, 'no eligible Coding Agent Provider is loaded')
-      throw new Error('no eligible Coding Agent Provider is loaded')
+      const detail = readOnly ? 'no eligible read-only Agent Provider is loaded' : 'no eligible Coding Agent Provider is loaded'
+      this.failNode(execution, detail)
+      throw new Error(detail)
     }
     const action = this.sideEffects.plan({
       runId,
@@ -1626,8 +1661,8 @@ export class AutoDevRuntime extends TypertRemoteService {
       planVersionId: plan.id,
       nodeId: node.id,
       attempt: run.attempt,
-      kind: node.kind === 'implement' ? 'implement' : 'custom',
-      instruction: run.request,
+      kind: readOnly ? mode === 'REVIEW' ? 'review' : 'analyze' : 'implement',
+      instruction: modeTaskInstruction(mode, run.request),
       acceptanceCriteria: run.acceptanceCriteria,
       workspacePath: worktreePath,
       createdAt: new Date().toISOString(),
@@ -1675,6 +1710,7 @@ export class AutoDevRuntime extends TypertRemoteService {
     ].join('\n'))
     const boundedCards = boundAgentContextCards(memoryCards, conceptCards, playbookCards, assumptionCards, uncertaintyCards, knowledgeCards)
     const context: AutoDevAgentContext = {
+      mode,
       runId,
       projectKey: run.repoRoot,
       repoRoot: run.repoRoot,
@@ -1752,10 +1788,52 @@ export class AutoDevRuntime extends TypertRemoteService {
     const outputTree = await this.git.treeHash(worktreePath, signal)
     const agentEvidence = {
       id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'AGENT_OUTPUT', status: 'PASS',
-      summary: `Provider ${result.provider} completed implementation`,
-      gitTreeHash: outputTree, artifactId: outputArtifact.id, createdAt: new Date().toISOString(),
+      summary: `Provider ${result.provider} completed ${mode.toLowerCase()} task`,
+      ...(readOnly ? {} : { gitTreeHash: outputTree }), artifactId: outputArtifact.id, createdAt: new Date().toISOString(),
     } as const
     this.store.saveEvidence(agentEvidence)
+    if (readOnly) {
+      const baseTreeResult = await this.commands.run(['git', 'rev-parse', `${run.baseCommit}^{tree}`], worktreePath, { signal })
+      if (baseTreeResult.exitCode !== 0) throw new Error(`cannot inspect read-only baseline tree: ${baseTreeResult.stderr.trim()}`)
+      const worktreeState = await this.commands.run(['git', 'status', '--porcelain=v1', '--untracked-files=all', '--ignored'], worktreePath, { signal })
+      const unchanged = baseTreeResult.stdout.trim() === outputTree && worktreeState.exitCode === 0 && worktreeState.stdout.trim() === ''
+      const review = mode === 'REVIEW'
+      const reviewOutcome = review ? parseReviewOutcome(result.output) : undefined
+      const decisionEvidence = {
+        id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+        type: review ? 'REVIEW' as const : 'ANALYSIS' as const,
+        status: unchanged && (!review || reviewOutcome === 'PASS') ? 'PASS' as const : 'WARN' as const,
+        source: 'agent' as const,
+        artifactId: outputArtifact.id,
+        summary: !unchanged
+          ? 'Read-only Agent modified the isolated Worktree; output is not accepted'
+          : review
+            ? reviewOutcome === 'PASS' ? 'Read-only Agent returned a structured review with no findings' : 'Review output was missing a valid PASS verdict; human review is required'
+            : `${mode} report captured from ${result.provider}`,
+        createdAt: new Date().toISOString(),
+      }
+      this.store.saveEvidence(decisionEvidence)
+      if (!unchanged) {
+        this.sideEffects.fail(action.id, 'read-only Agent modified the isolated Worktree', [decisionEvidence.id])
+        this.store.saveEvidence({
+          id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: 'DRIFT', status: 'FAIL', source: 'system', gitTreeHash: outputTree,
+          summary: 'Read-only mode changed the Candidate Worktree; original repository was not touched', createdAt: new Date().toISOString(),
+        })
+        this.failNode(execution, 'read-only Agent modified the isolated Worktree')
+        throw new InterventionRequiredError('read-only mode modified files in its isolated Worktree; inspect the retained result and re-run with an explicit write mode if appropriate', ['abandon', 'cancel'])
+      }
+      this.sideEffects.commit(action.id, `read-only ${mode.toLowerCase()} report captured`, undefined, outputTree, [agentEvidence.id, decisionEvidence.id])
+      this.store.saveEvidence({
+        id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+        type: 'SIDE_EFFECT', status: 'PASS', source: 'system',
+        summary: `${mode} Agent completed without changing the Worktree`, createdAt: new Date().toISOString(),
+      })
+      this.completeNode(execution, selection.candidate.provider, outputTree)
+      const intervention = this.ingestAgentSignals(run, plan.id, task, selection.candidate.provider, result.signals)
+      if (intervention.reason !== undefined) throw new InterventionRequiredError(intervention.reason, intervention.options)
+      return
+    }
     const diff = await this.git.diff(worktreePath, run.baseCommit, signal)
     const diffArtifact = this.store.writeArtifact(runId, 'candidate-diff', diff, '.patch')
     const candidate: CandidateRevision = {
@@ -1831,7 +1909,10 @@ export class AutoDevRuntime extends TypertRemoteService {
     const run = this.requireRun(runId)
     const verification = this.recordVerification(runId)
     if (verification.status !== 'PASS') {
-      this.openGate(runId, `deterministic verification is ${verification.status}: ${verification.summary}`, ['rework', 'replan', 'promote', 'abandon', 'cancel'])
+      const options: HumanGate['options'] = run.candidateId === undefined
+        ? ['rework', 'replan', 'abandon', 'cancel']
+        : ['rework', 'replan', 'promote', 'abandon', 'cancel']
+      this.openGate(runId, `deterministic verification is ${verification.status}: ${verification.summary}`, options)
       return
     }
     this.recordRunLearnings(run, verification)
@@ -2011,16 +2092,22 @@ export class AutoDevRuntime extends TypertRemoteService {
     const run = this.requireRun(runId)
     const candidate = run.candidateId === undefined ? undefined : this.store.getCandidate(run.candidateId)
     const evidence = this.store.listEvidence(runId)
+    const diffArtifact = candidate?.diffArtifactId === undefined ? undefined : this.store.getArtifact(candidate.diffArtifactId)
+    const diffText = diffArtifact === undefined ? '' : this.store.readArtifact(diffArtifact).subarray(0, 24_000).toString('utf8')
     const result = await this.decisions.evaluate('quality', {
       request: run.request,
       acceptanceCriteria: run.acceptanceCriteria,
       candidateTree: candidate?.gitTreeHash,
+      candidateDiff: diffText,
+      candidateDiffTruncated: diffArtifact !== undefined && diffArtifact.bytes > 24_000,
       evidence: evidence.map(item => ({ type: item.type, status: item.status, summary: item.summary })),
     }, signal)
     this.recordJev(runId, 'quality', result, result.degraded === undefined ? 'accepted' : 'degraded', result.degraded ?? 'quality decision recorded')
     const score = answerOf(result, 'score')?.value
-    const needsReview = answerOf(result, 'needs_review')?.value === true
-    const scorePass = typeof score === 'number' && score >= this.config.qualityMinScore
+    // Missing or malformed review intent is not an approval. Only an explicit false may pass.
+    const needsReview = answerOf(result, 'needs_review')?.value !== false
+    const trustedReview = result.source === 'jev'
+    const scorePass = trustedReview && typeof score === 'number' && score >= this.config.qualityMinScore
     const reviewStatus = scorePass && !needsReview ? 'PASS' : 'WARN'
     this.store.saveEvidence({
       id: randomUUID(),
@@ -2029,15 +2116,19 @@ export class AutoDevRuntime extends TypertRemoteService {
       type: 'REVIEW',
       planId: this.activePlan(run).id,
       status: reviewStatus,
+      source: trustedReview ? 'jev' : 'system',
       ...(candidate === undefined ? {} : { candidateId: candidate.id, gitTreeHash: candidate.gitTreeHash }),
       summary: typeof score === 'number'
-        ? `Jev quality score ${score}/${100}; minimum ${this.config.qualityMinScore}${needsReview ? '; additional human review requested' : ''}`
+        ? `${trustedReview ? 'Jev' : 'Untrusted fallback'} quality score ${score}/${100}; minimum ${this.config.qualityMinScore}${needsReview ? '; additional human review requested' : ''}${trustedReview ? '' : '; fallback output cannot approve code review'}`
         : 'Jev quality score was not available; human review is required',
       createdAt: new Date().toISOString(),
     })
     this.recordVerification(runId)
     if (!scorePass || needsReview) {
-      this.openGate(runId, `quality review required${typeof score === 'number' ? `: score ${score}/${100}` : ''}`, ['rework', 'replan', 'promote', 'abandon', 'cancel'])
+      const reason = !trustedReview
+        ? 'quality review is unavailable from the configured decision service; static/advisory fallback cannot create Review PASS Evidence'
+        : `quality review required${typeof score === 'number' ? `: score ${score}/${100}` : ''}`
+      this.openGate(runId, reason, ['rework', 'replan', 'abandon', 'cancel'])
       return false
     }
     return true
@@ -2239,6 +2330,7 @@ export class AutoDevRuntime extends TypertRemoteService {
       stateHash: result.stateHash,
       questionSetVersion: result.questionSetVersion,
       source: result.source,
+      ...(result.providerId === undefined ? {} : { providerId: result.providerId }),
       modelVersion: result.modelVersion,
       answer: result.answers,
       ...(first?.probability === undefined ? {} : {
@@ -2352,7 +2444,7 @@ export class AutoDevRuntime extends TypertRemoteService {
       conceptIds: this.concepts.search(runScope(run), run.request).slice(0, 8).map(item => item.id),
       playbookIds: this.playbooks.search(runScope(run), run.request).filter(item => item.status === 'ACTIVE').slice(0, 8).map(item => item.id),
       assumptionIds: this.store.listAssumptions(runId).map(item => item.id),
-      fingerprint: fingerprint({ buildDriverId: current.buildDriverId, nodes: current.nodes }),
+      fingerprint: fingerprint({ mode: current.mode ?? run.mode ?? 'DEV', executionEnvironment: run.executionEnvironment?.kind ?? 'LOCAL_WORKTREE', buildDriverId: current.buildDriverId ?? null, nodes: current.nodes }),
       createdAt: new Date().toISOString(),
     }
     this.store.withTransaction(() => {
@@ -2366,16 +2458,15 @@ export class AutoDevRuntime extends TypertRemoteService {
     return plan
   }
 
-  private makePlan(run: Run, buildDriverId: BuildDriverId): PlanVersion {
-    const nodes: PlanNode[] = [
-      { id: 'implement', kind: 'implement', description: 'Implement the requested change in the isolated Worktree', dependencies: [], expectedOutputs: ['source diff'], routeName: 'implement' },
-      { id: 'build', kind: 'build', description: `Run the ${buildDriverId} build and capture immutable evidence`, dependencies: ['implement'], expectedOutputs: ['BUILD PASS'] },
-      { id: 'test', kind: 'test', description: `Run the ${buildDriverId} test suite and capture immutable evidence`, dependencies: ['build'], expectedOutputs: ['TEST PASS'] },
-    ]
+  private makePlan(run: Run, buildDriverId?: BuildDriverId): PlanVersion {
+    const mode = run.mode ?? 'DEV'
+    const nodes = createModePlanNodes(mode, buildDriverId)
     const playbookIds = this.playbooks.search(runScope(run), run.request).filter(item => item.status === 'ACTIVE').slice(0, 8).map(item => item.id)
     const conceptIds = this.concepts.search(runScope(run), run.request).slice(0, 8).map(item => item.id)
     return {
-      schemaVersion: 1, id: randomUUID(), runId: run.id, version: 1, status: 'ACTIVE', fingerprint: fingerprint({ buildDriverId, nodes }), nodes, buildDriverId, createdAt: new Date().toISOString(),
+      schemaVersion: 1, id: randomUUID(), runId: run.id, version: 1, status: 'ACTIVE',
+      fingerprint: fingerprint({ mode, executionEnvironment: run.executionEnvironment?.kind ?? 'LOCAL_WORKTREE', buildDriverId: buildDriverId ?? null, nodes }),
+      mode, nodes, ...(buildDriverId === undefined ? {} : { buildDriverId }), createdAt: new Date().toISOString(),
       ...(conceptIds.length === 0 ? {} : { conceptIds }),
       ...(playbookIds.length === 0 ? {} : { playbookIds }),
     }
@@ -2537,21 +2628,22 @@ export class AutoDevRuntime extends TypertRemoteService {
     return resolved.agent
   }
 
-  private async environment(repoRoot: string, buildDriverId: BuildDriverId, signal?: AbortSignal): Promise<EnvironmentFingerprint> {
+  private async environment(repoRoot: string, buildDriverId?: BuildDriverId, signal?: AbortSignal): Promise<EnvironmentFingerprint> {
     const [git, java, maven] = await Promise.all([
       this.commands.run(['git', '--version'], repoRoot, { signal, timeoutMs: this.config.commandTimeoutMs }),
       this.probe(['java', '-version'], repoRoot, signal),
       buildDriverId === 'maven' ? this.probe(['mvn', '-version'], repoRoot, signal) : Promise.resolve(undefined),
     ])
-    const build = commandForDriver(buildDriverId, 'build', repoRoot, this.driverSettings())
-    const test = commandForDriver(buildDriverId, 'test', repoRoot, this.driverSettings())
+    const build = buildDriverId === undefined ? undefined : commandForDriver(buildDriverId, 'build', repoRoot, this.driverSettings())
+    const test = buildDriverId === undefined ? undefined : commandForDriver(buildDriverId, 'test', repoRoot, this.driverSettings())
     return {
-      platform: process.platform, arch: process.arch, node: process.version, buildDriverId,
+      platform: process.platform, arch: process.arch, node: process.version,
+      ...(buildDriverId === undefined ? {} : { buildDriverId }),
       ...(git.exitCode === 0 ? { git: git.stdout.trim() } : {}),
       ...(java?.exitCode === 0 ? { java: `${java.stdout}\n${java.stderr}`.trim().split(/\r?\n/)[0] } : {}),
       ...(maven?.exitCode === 0 ? { maven: `${maven.stdout}\n${maven.stderr}`.trim().split(/\r?\n/)[0] } : {}),
-      buildArgs: [...build.argv.slice(1)],
-      testArgs: [...test.argv.slice(1)],
+      ...(build === undefined ? {} : { buildArgs: [...build.argv.slice(1)] }),
+      ...(test === undefined ? {} : { testArgs: [...test.argv.slice(1)] }),
       ...(process.env.DSH_VERSION === undefined ? {} : { harness: process.env.DSH_VERSION }),
       capturedAt: new Date().toISOString(),
     }
@@ -2782,6 +2874,18 @@ function stableStringify(value: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseReviewOutcome(output: string): 'PASS' | 'NEEDS_CHANGES' | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(output)
+  } catch {
+    return undefined
+  }
+  if (!isRecord(parsed) || (parsed.verdict !== 'PASS' && parsed.verdict !== 'NEEDS_CHANGES') || !Array.isArray(parsed.findings)) return undefined
+  if (parsed.findings.some(item => !isRecord(item) || typeof item.message !== 'string' || !['low', 'medium', 'high', 'critical'].includes(String(item.severity)))) return undefined
+  return parsed.verdict === 'PASS' && parsed.findings.length === 0 ? 'PASS' : 'NEEDS_CHANGES'
 }
 
 function isAbort(error: unknown, signal: AbortSignal): boolean {

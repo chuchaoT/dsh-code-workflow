@@ -7,6 +7,8 @@
  * Code, a CLI, or a future local adapter.
  */
 
+import type { AutoDevMode } from './contracts.ts'
+
 export const AGENT_PROTOCOL_VERSION = 'dsh.agent.v1' as const
 
 /** Maximum combined characters for Host-curated, supplemental Agent context cards. */
@@ -64,6 +66,8 @@ export interface AgentExecution {
 
 /** Context is intentionally a reference card, not a transcript dump. */
 export interface AutoDevAgentContext {
+  /** Optional for compatibility with older Agent Protocol contexts. */
+  readonly mode?: AutoDevMode
   readonly runId: string
   readonly projectKey: string
   readonly repoRoot: string

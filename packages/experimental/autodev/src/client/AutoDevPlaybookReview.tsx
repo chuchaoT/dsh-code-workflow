@@ -125,7 +125,7 @@ function PlaybookCard({ playbook, snapshot, remote, t, busy, onSnapshotAction }:
     }))
   }
 
-  return <article style={{ marginTop: 6, padding: 8, border: '1px solid #e5e7eb', borderRadius: 6 }}>
+  return <article style={{ marginTop: 6, padding: 10, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
     <p style={{ margin: '2px 0' }}><strong>{playbook.name}</strong> · {playbook.key} · v{playbook.version} · {playbook.status}</p>
     <p style={{ margin: '4px 0' }}>{playbook.purpose}</p>
     <p style={{ margin: '4px 0' }}>{t('playbookTargets')}: {playbook.targets.join(', ')} · {t('playbookEffects')}: {playbook.effects.join(', ')}</p>

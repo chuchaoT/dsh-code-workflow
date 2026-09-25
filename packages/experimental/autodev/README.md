@@ -9,11 +9,12 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-AutoDev adds a resumable software-engineering workflow to a DeepSeek Harness profile. It runs Coding Agents in Git Worktrees, checks changes with a repository-specific Build/Test driver, and requires explicit approval before promotion to the original checkout. It reuses Harness-loaded Codex and Claude Code providers and accepts additional providers through a registration contract. The Host owns durable state; the sidebar is a bounded client, not an authority for execution or promotion.
+AutoDev adds a resumable software-engineering workflow to a DeepSeek Harness profile. It runs Coding Agents in Git Worktrees, selects an explicit engineering mode, checks changes with repository-specific Build/Test drivers when available, and requires explicit approval before promotion to the original checkout. It supports a genuinely empty Git repository with no initial commit or configured author identity. It reuses Harness-loaded Codex and Claude Code providers and accepts additional providers through registration contracts. The Host owns durable state; the sidebar is a bounded client, not an authority for execution or promotion.
 
 ## Table of Contents
 
 - [Use this package](#use-this-package)
+- [Work modes and execution environment](#work-modes-and-execution-environment)
 - [Understand the implementation](#understand-the-implementation)
 - [Public API Contracts](#public-api-contracts)
 - [Further Exploration](#further-exploration)
@@ -48,11 +49,28 @@ The Bundle adds one Host-owned workflow and a client view to a DSH profile:
 - Git baseline checks, fresh Worktrees for attempts, bounded diffs, drift detection, and guarded promotion.
 - A normalized Agent Protocol and dynamic ProviderRouter; the built-in `codex`, `claude-code`, and `spawn` routes use Harness-loaded Providers.
 - Root-level Maven, Gradle, npm/pnpm/yarn/bun, and pytest Build/Test driver selection, frozen into each Plan.
+- Nine explicit/auto-detected work modes, separated from workflow lifecycle states; read-only modes do not require a build driver or code Candidate.
 - Project-scoped Memory, Business Concepts, Assumptions, Semantic Uncertainty, versioned Playbooks, and evidence-backed Knowledge evolution.
 - Model tools for runs, Gates, retrieval, correction, regression checks, and compaction; a Web sidebar shows run snapshots and bounded Candidate diffs, with side-by-side comparison of two revisions from the same Run and their verification evidence.
-- Optional Jev decisions with `required`, `advisory`, and `off` modes; Jev cannot override a failed deterministic Build or Test result.
+- Optional Jev/local decision-provider chain with `required`, `advisory`, and `off` modes; deterministic fallback decisions cannot create a Review PASS or override failed Build/Test Evidence.
 
 The Host derives the project key from the inspected Git repository. Optional module, branch, language, project-version, schema-version, and tech-stack-version fields narrow knowledge scope; callers cannot use them to redirect a Run to another project.
+
+### Decision-provider extension
+
+The existing `DecisionProvider` contract can be extended without replacing the route router or Jev HTTP adapter. A separate DSH Bundle may register a local model or another Jev-compatible service, give it an explicit priority, and dispose it on unload:
+
+```ts
+import type { DecisionProvider } from '@deepseek-ai/dsh-experimental-autodev'
+
+declare const ctx: { autodev: { registerDecisionProvider(id: string, provider: DecisionProvider, priority?: number): () => void } }
+declare const localModelAdapter: DecisionProvider
+
+const removeLocalModel = ctx.autodev.registerDecisionProvider('local-qwen', localModelAdapter, 20)
+// Call removeLocalModel() when the contributing Bundle unloads.
+```
+
+Higher priorities are tried first. Invalid, low-confidence (when configured), or unavailable providers fall through to the next; `required` fails if none succeeds, while `advisory` uses the explicitly untrusted static fallback. A provider must identify an actual model-backed decision as `source: 'jev'`; rule/static adapters must not claim that source. Quality Review PASS additionally requires a valid score above policy and an explicit `needs_review: false`. Code-run quality decisions include up to 24,000 bytes of Candidate Diff, which may contain proprietary source; confirm the configured remote Jev backend's data-handling boundary before enabling it. Path sharing remains separately controlled by `sendPaths`. Provider probability is not assumed calibrated unless a confidence threshold is configured. This seam does not bundle a Qwen model or connect DSH's Ollama endpoint automatically.
 
 ### Add a Provider or route
 
@@ -162,11 +180,38 @@ For a self-hosted [FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi) gate
 
 The OpenAI-compatible client requires a credential value even when the local Ollama server ignores it, so keep the placeholder in DSH's credential mechanism rather than a checked-in profile. Ollama and FreeLLMAPI supply model inference; they do not provide a coding Agent's workspace tools, execution lifecycle, or AutoDev Evidence. Run an Ollama-backed Agent through a DSH Agent composition (for example, a `spawn` child inheriting a Session configured for `ollama-local`), while CodeBuddy remains an ACP Agent candidate. The route seam is extensible, but live endpoint and Agent end-to-end verification remain release checks.
 
+<a id="work-modes-and-execution-environment"></a>
+### Work modes and execution environment
+
+Work mode answers “what engineering strategy should this Run use?” Workflow state answers “where is the Run in its lifecycle?” Execution environment answers “where does the work happen?” They are separate contracts.
+
+| Work mode | Intent | Default plan shape |
+| --- | --- | --- |
+| `EXPLORE` | Understand repository structure and behavior | Read-only Agent analysis |
+| `IMPACT` | Trace dependencies and change impact | Read-only Agent analysis |
+| `DEV` | Implement a normal requirement | Implement → optional Build → optional Test → Jev quality review |
+| `DEBUG` | Find root cause, fix, and regress | Implement/fix → optional Build/Test → quality review |
+| `DATABASE` | Make schema/migration changes safely | Implement → optional Build/Test → quality review |
+| `REFACTOR` | Refactor while preserving behavior | Implement → optional Build/Test → quality review |
+| `TEST` | Add or improve tests and run regressions | Implement tests → optional Build/Test → quality review |
+| `REVIEW` | Report concrete findings without editing | Structured read-only review |
+| `RELEASE` | Assess release readiness without editing | Read-only release analysis |
+
+The sidebar offers `AUTO` plus each explicit mode. Explicit selection always wins; auto classification is deterministic and defaults ambiguous requests to `DEV`. Newly created Runs persist the resolved mode and whether it was explicit or inferred. Older Runs without that field are interpreted as `DEV`. Workflow statuses such as `EXECUTING`, `BUILDING`, `TESTING`, and `VERIFY` remain lifecycle states, not modes.
+
+The only execution environment implemented today is `LOCAL_WORKTREE`: a Host-managed Git Worktree. Docker, remote sandboxes, and Agent Substrate are future adapters, not current selectable options. A Worktree isolates edits from the original checkout, but is not an operating-system sandbox. Read-only modes require a route declaring `read-only` and fail/gate if Git observes changes in the Worktree; that does not contain arbitrary side effects outside the Worktree.
+
+#### Starting from an empty Git repository
+
+AutoDev accepts a repository whose current branch is unborn only when the working tree is genuinely empty (including no ignored files). It creates a private synthetic baseline commit object in the repository object database so Git Worktree and patch operations can work. The synthetic commit is not installed as a branch/HEAD commit, does not change global/local Git author configuration, and does not modify the user's index. Build/Test stages are omitted when no supported root driver exists, and the Environment Evidence visibly warns about that gap. A successful model-backed review is still required before `VERIFY`; promotion applies the candidate patch as ordinary untracked files and leaves the branch unborn. If you want a committed baseline, create it yourself before starting instead.
+
+`EXPLORE`, `IMPACT`, `REVIEW`, and `RELEASE` run a single read-only Agent task, do not create a code Candidate, and do not require Build/Test drivers. Review output must be strict JSON with `verdict` and `findings`; invalid output stays `WARN` and opens a Human Gate. Their Worktrees remain isolated and auditable.
+
 ### Run and promote safely
 
 The normal flow keeps unverified edits out of the original checkout:
 
-1. Create a DRAFT Run from a clean Git repository; AutoDev records a baseline and an immutable Plan.
+1. Create a DRAFT Run from a clean committed repository or a genuinely empty unborn repository; AutoDev records a baseline, resolved mode, execution environment, and immutable Plan.
 2. Review the Plan and acceptance criteria in the sidebar, then explicitly approve that exact Plan version. `autodev_run` refuses an unapproved Plan; Replan requires fresh approval.
 3. Run the attempt from a live DSH Agent session in a managed Worktree, then collect Build, Test, verification, and side-effect Evidence. The sidebar does not yet start official subagent providers because they require a parent Agent.
 4. Review any Human Gate, stale baseline, failed check, unresolved uncertainty, or unknown external outcome; AutoDev does not automatically retry an unknown side effect.

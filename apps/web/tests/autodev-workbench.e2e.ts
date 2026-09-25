@@ -40,6 +40,7 @@ it('creates and approves a Run, restores a failed gate after Host restart, then 
   let page: Page | undefined
   const providerWorkspaces: string[] = []
   const providerContexts: AutoDevAgentContext[] = []
+  const providerInstructions: string[] = []
 
   const launch = async (harnessHome: string): Promise<void> => {
     scaffold = await launchWebScaffold({
@@ -47,6 +48,21 @@ it('creates and approves a Run, restores a failed gate after Host restart, then 
       profile: { packages: [{ dir: AUTODEV_PACKAGE, enabled: true }] },
       extraOverlayPath: overlayPath,
     })
+    scaffold.ctx.autodev.registerDecisionProvider('web-e2e-quality-decisions', {
+      async evaluate(request) {
+        return {
+          source: 'jev',
+          modelVersion: 'web-e2e-deterministic-decision',
+          answers: request.questions.map(question => ({
+            questionId: question.id,
+            kind: question.type,
+            value: question.type === 'choice' ? question.choices?.[0] ?? 'ready_for_verify'
+              : question.type === 'score' ? question.max ?? 100 : false,
+            probability: 1,
+          })),
+        }
+      },
+    }, 10)
     scaffold.ctx.autodev.registerProvider({
       name: PROVIDER,
       kind: 'command',
@@ -56,10 +72,11 @@ it('creates and approves a Run, restores a failed gate after Host restart, then 
         request.signal.throwIfAborted()
         providerWorkspaces.push(request.cwd)
         if (request.context !== undefined) providerContexts.push(request.context)
-        if (request.request === FAILED_REQUEST) {
+        if (request.task !== undefined) providerInstructions.push(request.task.instruction)
+        if (request.task?.instruction.includes(FAILED_REQUEST)) {
           return { provider: PROVIDER, status: 'error', output: 'controlled fixture failure', diagnostic: 'controlled fixture failure' }
         }
-        if (request.request === SEMANTIC_REQUEST && request.context?.attempt === 1) {
+        if (request.task?.instruction.includes(SEMANTIC_REQUEST) && request.context?.attempt === 1) {
           request.emitSignal?.({
             type: 'SemanticUncertainty',
             subject: 'refund',
@@ -120,7 +137,7 @@ it('creates and approves a Run, restores a failed gate after Host restart, then 
         dataRoot,
         worktreeRoot,
         maxAttempts: 3,
-        jev: { mode: 'off' },
+        jev: { mode: 'required' },
         routes: {
           implement: {
             candidates: [],
@@ -145,12 +162,15 @@ it('creates and approves a Run, restores a failed gate after Host restart, then 
     const panel = page!.locator('[data-autodev-panel]')
     await panel.getByLabel('Absolute Git repository path').fill(repoRoot)
     await panel.getByLabel('Requested change').fill(FAILED_REQUEST)
+    expect(await panel.getByLabel('Work mode').inputValue()).toBe('AUTO')
+    await panel.getByLabel('Work mode').selectOption('DEBUG')
     await panel.getByLabel('Acceptance criteria (one per line)').fill('Keep the original repository unchanged until Promotion.')
     await panel.getByRole('button', { name: 'Create task and Plan' }).click()
     await panel.getByRole('button', { name: 'Approve this Plan version' }).waitFor({ timeout: 20_000 })
 
     const failedRun = scaffold!.ctx.autodev.listRuns().find(run => run.request === FAILED_REQUEST)
     expect(failedRun).toBeDefined()
+    expect(failedRun).toMatchObject({ mode: 'DEBUG', modeSource: 'explicit' })
     expect(scaffold!.ctx.autodev.snapshot(failedRun!.id).run.status).toBe('DRAFT')
     await panel.getByRole('button', { name: 'Approve this Plan version' }).click()
     await panel.getByRole('button', { name: 'Start in this DSH Session' }).waitFor({ timeout: 10_000 })
@@ -159,6 +179,8 @@ it('creates and approves a Run, restores a failed gate after Host restart, then 
       () => scaffold!.ctx.autodev.snapshot(failedRun!.id).run.status,
       { timeout: 30_000, interval: 100 },
     ).toBe('NEEDS_INTERVENTION')
+    expect(providerContexts[0]?.mode).toBe('DEBUG')
+    expect(providerInstructions[0]).toContain('[AutoDev mode: DEBUG]')
     expect((await readFile(join(repoRoot, 'src', 'result.txt'), 'utf8'))).toBe('original\n')
     expect(scaffold!.ctx.autodev.snapshot(failedRun!.id).gates.at(-1)?.options).toContain('abandon')
 
@@ -178,11 +200,13 @@ it('creates and approves a Run, restores a failed gate after Host restart, then 
 
     await recoveredPanel.getByLabel('Absolute Git repository path').fill(repoRoot)
     await recoveredPanel.getByLabel('Requested change').fill(SEMANTIC_REQUEST)
+    expect(await recoveredPanel.getByLabel('Work mode').inputValue()).toBe('AUTO')
     await recoveredPanel.getByLabel('Acceptance criteria (one per line)').fill('Resolve the refund meaning before running deterministic checks.')
     await recoveredPanel.getByRole('button', { name: 'Create task and Plan' }).click()
     await recoveredPanel.getByRole('button', { name: 'Approve this Plan version' }).waitFor({ timeout: 20_000 })
     const semanticRun = scaffold!.ctx.autodev.listRuns().find(run => run.request === SEMANTIC_REQUEST)
     expect(semanticRun).toBeDefined()
+    expect(semanticRun).toMatchObject({ mode: 'DEV', modeSource: 'auto' })
     const seededConcept = scaffold!.ctx.autodev.concepts.observe({
       scope: semanticRun!.scope ?? { projectKey: repoRoot },
       runId: semanticRun!.id,
@@ -251,6 +275,7 @@ it('creates and approves a Run, restores a failed gate after Host restart, then 
 
     const semanticVerified = scaffold!.ctx.autodev.snapshot(semanticRun!.id)
     const semanticContext = providerContexts.find(context => context.runId === semanticRun!.id && context.attempt === 2)
+    expect(semanticContext?.mode).toBe('DEV')
     expect(semanticContext?.conceptRefs).toContain(seededConcept.id)
     expect(semanticContext?.conceptCards?.join('\n')).toContain('version=2')
     expect(semanticContext?.conceptCards?.join('\n')).toContain('eligible partial reversal')

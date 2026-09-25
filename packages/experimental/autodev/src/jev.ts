@@ -109,7 +109,7 @@ export interface DecisionCoordinatorOptions {
 export class DecisionCoordinator {
   /** Resolved mode, confidence, endpoint, and data-sharing configuration. */
   readonly config: Required<Pick<JevConfig, 'mode' | 'questionSetVersion'>> & JevConfig
-  private readonly provider: DecisionProvider
+  private readonly providers: { readonly id: string; readonly provider: DecisionProvider; readonly priority: number }[]
   private readonly staticProvider: DecisionProvider
 
   constructor(options: DecisionCoordinatorOptions = {}) {
@@ -119,8 +119,25 @@ export class DecisionCoordinator {
       mode: config.mode ?? 'advisory',
       questionSetVersion: config.questionSetVersion ?? DEFAULT_QUESTION_SET,
     }
-    this.provider = options.provider ?? new HttpJevProvider(this.config)
+    this.providers = [{ id: 'jev-http', provider: options.provider ?? new HttpJevProvider(this.config), priority: 0 }]
     this.staticProvider = options.staticProvider ?? new StaticDecisionProvider()
+  }
+
+  /** Register an optional Jev/local-model decision provider without replacing existing adapters.
+   * Higher priority providers are tried first; a failed or invalid provider falls through to the next.
+   */
+  registerProvider(id: string, provider: DecisionProvider, priority: number = 0): () => void {
+    const normalizedId = id.trim()
+    if (normalizedId === '' || normalizedId.length > 128) throw new TypeError('decision provider id must be non-empty and bounded')
+    if (!Number.isFinite(priority)) throw new TypeError('decision provider priority must be finite')
+    if (this.providers.some(item => item.id === normalizedId)) throw new Error(`decision provider "${normalizedId}" is already registered`)
+    const registration = { id: normalizedId, provider, priority }
+    this.providers.push(registration)
+    this.providers.sort((left, right) => right.priority - left.priority || left.id.localeCompare(right.id))
+    return () => {
+      const index = this.providers.indexOf(registration)
+      if (index >= 0) this.providers.splice(index, 1)
+    }
   }
 
   /** Evaluate a bounded decision request and apply required/advisory/off policy.
@@ -141,29 +158,39 @@ export class DecisionCoordinator {
     const stateHash = sha256(stableStringify(sanitizeState(state, this.config.sendPaths === true)))
     if (this.config.mode === 'off') {
       const result = await this.staticProvider.evaluate({ purpose, state, questions, signal })
-      return { ...result, stateHash, questionSetVersion: this.config.questionSetVersion }
+      return { ...result, providerId: result.providerId ?? 'static-offline', stateHash, questionSetVersion: this.config.questionSetVersion }
     }
-    try {
-      const result = await this.provider.evaluate({ purpose, state, questions, signal })
-      validateDecisionResult(result, questions)
-      const threshold = this.config.minConfidence?.[purpose] ?? 0
-      const confidence = decisionConfidence(result)
-      if (threshold > 0 && (confidence === undefined || confidence < threshold)) {
-        throw new Error(`Jev confidence ${confidence === undefined ? 'missing' : confidence.toFixed(3)} is below ${threshold.toFixed(3)}`)
+    const failures: string[] = []
+    for (const registration of this.providers) {
+      try {
+        const result = await registration.provider.evaluate({ purpose, state, questions, signal })
+        validateDecisionResult(result, questions)
+        const threshold = this.config.minConfidence?.[purpose] ?? 0
+        const confidence = decisionConfidence(result)
+        if (threshold > 0 && (confidence === undefined || confidence < threshold)) {
+          throw new Error(`confidence ${confidence === undefined ? 'missing' : confidence.toFixed(3)} is below ${threshold.toFixed(3)}`)
+        }
+        return {
+          ...result,
+          providerId: result.providerId ?? registration.id,
+          stateHash,
+          questionSetVersion: this.config.questionSetVersion,
+        }
+      } catch (error: unknown) {
+        if (signal.aborted) throw error
+        failures.push(`${registration.id}: ${errorMessage(error)}`)
       }
-      return { ...result, stateHash, questionSetVersion: this.config.questionSetVersion }
-    } catch (error: unknown) {
-      if (this.config.mode === 'required') {
-        throw new JevUnavailableError(errorMessage(error), { cause: error })
-      }
-      const fallback = await this.staticProvider.evaluate({ purpose, state, questions, signal })
-      return {
-        ...fallback,
-        source: 'fallback',
-        stateHash,
-        questionSetVersion: this.config.questionSetVersion,
-        degraded: errorMessage(error),
-      }
+    }
+    const failureSummary = failures.join('; ') || 'no decision providers are registered'
+    if (this.config.mode === 'required') throw new JevUnavailableError(failureSummary)
+    const fallback = await this.staticProvider.evaluate({ purpose, state, questions, signal })
+    return {
+      ...fallback,
+      source: 'fallback',
+      providerId: 'static-fallback',
+      stateHash,
+      questionSetVersion: this.config.questionSetVersion,
+      degraded: failureSummary,
     }
   }
 }

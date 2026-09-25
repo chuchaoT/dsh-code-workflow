@@ -65,46 +65,53 @@ export function AutoDevBackupRecovery({ remote, t }: AutoDevBackupRecoveryProps)
     }
   }
 
-  return <section
-    aria-label={t('backupRecovery')}
-    style={{ padding: 8, border: '1px solid #e5e7eb', borderRadius: 6 }}
-  >
-    <strong>{t('backupRecovery')}</strong>
-    <p style={{ margin: '4px 0' }}>{t('backupRecoveryNotice')}</p>
-    <label style={{ display: 'grid', gap: 4, marginTop: 6 }}>{t('backupDestinationPath')}
-      <input value={backupDestinationPath} onChange={(event) => {
-        setBackupDestinationPath(event.currentTarget.value)
-        setOutcome(undefined)
-      }} disabled={busy} />
-    </label>
-    <button type="button" disabled={busy || backupDestinationPath.trim() === ''} onClick={() => { void createBackup() }}>
-      {busy ? t('backupWorking') : t('createBackup')}
-    </button>
-    <label style={{ display: 'grid', gap: 4, marginTop: 8 }}>{t('restoreBackupPath')}
-      <input value={restoreBackupPath} onChange={(event) => {
-        setRestoreBackupPath(event.currentTarget.value)
-        setOutcome(undefined)
-      }} disabled={busy} />
-    </label>
-    <label style={{ display: 'grid', gap: 4, marginTop: 6 }}>{t('restoreTargetDataRoot')}
-      <input value={restoreTargetDataRoot} onChange={(event) => {
-        setRestoreTargetDataRoot(event.currentTarget.value)
-        setConfirmedTargetDataRoot('')
-        setOutcome(undefined)
-      }} disabled={busy} />
-    </label>
-    <label style={{ display: 'grid', gap: 4, marginTop: 6 }}>{t('restoreConfirmation')}
-      <input value={confirmedTargetDataRoot} onChange={(event) => {
-        setConfirmedTargetDataRoot(event.currentTarget.value)
-      }} disabled={busy} />
-    </label>
-    <button
-      type="button"
-      disabled={busy || restoreBackupPath.trim() === '' || restoreTargetDataRoot.trim() === '' || confirmedTargetDataRoot !== restoreTargetDataRoot}
-      onClick={() => { void restoreBackup() }}>
-      {busy ? t('backupWorking') : t('restoreBackup')}
-    </button>
-    {error !== undefined && <p role="alert" style={{ color: '#b91c1c', margin: '4px 0' }}>{t('error')}: {error}</p>}
+  return <section aria-label={t('backupRecovery')} data-autodev-section="backup">
+    <div>
+      <strong>{t('backupRecovery')}</strong>
+      <p style={{ margin: '4px 0' }}>{t('backupRecoveryNotice')}</p>
+    </div>
+    <div data-autodev-backup-grid>
+      <div data-autodev-backup-create>
+        <strong>{t('createBackup')}</strong>
+        <label>{t('backupDestinationPath')}
+          <input value={backupDestinationPath} onChange={(event) => {
+            setBackupDestinationPath(event.currentTarget.value)
+            setOutcome(undefined)
+          }} disabled={busy} />
+        </label>
+        <button type="button" disabled={busy || backupDestinationPath.trim() === ''} onClick={() => { void createBackup() }}>
+          {busy ? t('backupWorking') : t('createBackup')}
+        </button>
+      </div>
+      <div data-autodev-backup-restore>
+        <strong>{t('restoreBackup')}</strong>
+        <label>{t('restoreBackupPath')}
+          <input value={restoreBackupPath} onChange={(event) => {
+            setRestoreBackupPath(event.currentTarget.value)
+            setOutcome(undefined)
+          }} disabled={busy} />
+        </label>
+        <label>{t('restoreTargetDataRoot')}
+          <input value={restoreTargetDataRoot} onChange={(event) => {
+            setRestoreTargetDataRoot(event.currentTarget.value)
+            setConfirmedTargetDataRoot('')
+            setOutcome(undefined)
+          }} disabled={busy} />
+        </label>
+        <label>{t('restoreConfirmation')}
+          <input value={confirmedTargetDataRoot} onChange={(event) => {
+            setConfirmedTargetDataRoot(event.currentTarget.value)
+          }} disabled={busy} />
+        </label>
+        <button
+          type="button"
+          disabled={busy || restoreBackupPath.trim() === '' || restoreTargetDataRoot.trim() === '' || confirmedTargetDataRoot !== restoreTargetDataRoot}
+          onClick={() => { void restoreBackup() }}>
+          {busy ? t('backupWorking') : t('restoreBackup')}
+        </button>
+      </div>
+    </div>
+    {error !== undefined && <p role="alert" style={{ color: 'var(--dsw-alias-state-error-primary, #c62828)', margin: '4px 0' }}>{t('error')}: {error}</p>}
     {outcome !== undefined && <p role="status" style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>
       {outcome.operation === 'created' ? t('backupCreated') : t('backupRestored')}
       {' · '}{t('backupFileCount')}: {outcome.fileCount} · {outcome.createdAt}
