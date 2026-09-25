@@ -38,6 +38,9 @@ describe('AutoDev DSH Tool Runtime composition', () => {
       expect(names).toContain('autodev_knowledge_restore_compaction')
       expect(names).toContain('autodev_knowledge_promote')
       expect(names).toContain('autodev_concept_history')
+      const createSchema = ctx.tools.schemas().find(schema => schema.name === 'autodev_create')
+      expect(JSON.stringify(createSchema)).toContain('"AUTO"')
+      expect(JSON.stringify(createSchema)).toContain('"DEBUG"')
 
       const now = new Date().toISOString()
       const runId = 'tool-composition-run'

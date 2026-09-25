@@ -11,7 +11,7 @@ import type {
 } from './contracts.ts'
 import type { AgentAdapter, AgentAdapterRequest, AgentResult } from './protocol.ts'
 import { HarnessCommandExecutor, type CommandExecutor } from './command.ts'
-import { answerOf, DecisionCoordinator, questionsFor, replaceQuestionChoices } from './jev.ts'
+import { answerOf, DecisionCoordinator, questionsFor, replaceQuestionChoices, type DecisionExecutionContext } from './jev.ts'
 import type { AutoDevStore } from './store.ts'
 
 /** A dynamically registered provider normalized to AutoDev's run contract. */
@@ -248,6 +248,7 @@ export class ProviderRouter {
     state: unknown,
     requiredTraits: readonly string[] = [],
     signal: AbortSignal,
+    executionContext: DecisionExecutionContext = {},
   ): Promise<RouteSelection> {
     const policy = this.routes[routeName]
     if (policy === undefined) throw new Error(`AutoDev route "${routeName}" is not configured`)
@@ -278,13 +279,17 @@ export class ProviderRouter {
 
     let selected: RouteCandidate | undefined
     let confidence: number | undefined
+    let decisionSource: RouteDecision['decisionSource']
+    let decisionProviderId: string | undefined
     let reason = 'no eligible provider'
     if (eligible.length > 0) {
       const questions = replaceQuestionChoices(questionsFor(purpose), eligible.map(item => item.provider))
       const decision = await this.decisions.evaluate(purpose, {
         ...asRecord(state),
         eligibleProviders: eligible.map(item => item.provider),
-      }, signal, questions)
+      }, signal, questions, executionContext)
+      decisionSource = decision.source
+      decisionProviderId = decision.providerId
       const answer = answerOf(decision, 'provider')
       confidence = answer?.probability
       const requested = typeof answer?.value === 'string' ? answer.value : undefined
@@ -309,6 +314,8 @@ export class ProviderRouter {
       eligible,
       ...(selected === undefined ? {} : { selected }),
       ...(confidence === undefined ? {} : { confidence }),
+      ...(decisionSource === undefined ? {} : { decisionSource }),
+      ...(decisionProviderId === undefined ? {} : { decisionProviderId }),
       reason,
       rejections,
       createdAt: new Date().toISOString(),

@@ -13,6 +13,8 @@ import type {
 const DEFAULT_ENDPOINT = 'https://api.typesafe.ai/v1/systemone'
 const DEFAULT_MODEL = 'system-one'
 const DEFAULT_QUESTION_SET = 'autodev.v1'
+const DECISION_PURPOSES: readonly DecisionPurpose[] = ['intent', 'agent-route', 'failure-action', 'quality', 'completion']
+const DECISION_SOURCES = ['jev', 'local-model', 'subagent', 'static', 'fallback'] as const
 
 /** Jev could not supply a valid answer under the configured retry and policy rules. */
 export class JevUnavailableError extends Error {
@@ -103,13 +105,37 @@ export interface DecisionCoordinatorOptions {
   readonly config?: JevConfig
   readonly provider?: DecisionProvider
   readonly staticProvider?: DecisionProvider
+  /** Extra providers ordered by priority. */
+  readonly providers?: readonly DecisionProviderRegistration[]
+  /** Omit the built-in remote Jev adapter when a separate local-first chain is configured. */
+  readonly includeJevProvider?: boolean
+}
+
+/** One Host-registered provider plus trust assigned by configuration, never by model output. */
+export interface DecisionProviderRegistration {
+  readonly id: string
+  readonly provider: DecisionProvider
+  readonly priority?: number
+  readonly trustedFor?: readonly DecisionPurpose[]
+}
+
+/** Ephemeral DSH call context used only by optional Subagent escalation. */
+export interface DecisionExecutionContext {
+  readonly parentAgent?: unknown
+  /** Skip providers not explicitly trusted for this purpose and continue down the chain. */
+  readonly requireTrustedForPurpose?: boolean
 }
 
 /** Applies the required/advisory/off policy around a real or static provider. */
 export class DecisionCoordinator {
   /** Resolved mode, confidence, endpoint, and data-sharing configuration. */
   readonly config: Required<Pick<JevConfig, 'mode' | 'questionSetVersion'>> & JevConfig
-  private readonly providers: { readonly id: string; readonly provider: DecisionProvider; readonly priority: number }[]
+  private readonly providers: {
+    readonly id: string
+    readonly provider: DecisionProvider
+    readonly priority: number
+    readonly trustedFor: readonly DecisionPurpose[]
+  }[]
   private readonly staticProvider: DecisionProvider
 
   constructor(options: DecisionCoordinatorOptions = {}) {
@@ -119,19 +145,28 @@ export class DecisionCoordinator {
       mode: config.mode ?? 'advisory',
       questionSetVersion: config.questionSetVersion ?? DEFAULT_QUESTION_SET,
     }
-    this.providers = [{ id: 'jev-http', provider: options.provider ?? new HttpJevProvider(this.config), priority: 0 }]
+    this.providers = []
+    if (options.includeJevProvider !== false) {
+      this.registerProvider('jev-http', options.provider ?? new HttpJevProvider(this.config), 0, ['intent', 'agent-route', 'failure-action', 'quality', 'completion'])
+    }
+    for (const registration of options.providers ?? []) {
+      this.registerProvider(registration.id, registration.provider, registration.priority ?? 0, registration.trustedFor ?? [])
+    }
     this.staticProvider = options.staticProvider ?? new StaticDecisionProvider()
   }
 
   /** Register an optional Jev/local-model decision provider without replacing existing adapters.
    * Higher priority providers are tried first; a failed or invalid provider falls through to the next.
    */
-  registerProvider(id: string, provider: DecisionProvider, priority: number = 0): () => void {
+  registerProvider(id: string, provider: DecisionProvider, priority: number = 0, trustedFor: readonly DecisionPurpose[] = []): () => void {
     const normalizedId = id.trim()
     if (normalizedId === '' || normalizedId.length > 128) throw new TypeError('decision provider id must be non-empty and bounded')
     if (!Number.isFinite(priority)) throw new TypeError('decision provider priority must be finite')
+    if (!Array.isArray(trustedFor) || trustedFor.some(purpose => !DECISION_PURPOSES.includes(purpose))) {
+      throw new TypeError('decision provider trustedFor contains an unsupported purpose')
+    }
     if (this.providers.some(item => item.id === normalizedId)) throw new Error(`decision provider "${normalizedId}" is already registered`)
-    const registration = { id: normalizedId, provider, priority }
+    const registration = { id: normalizedId, provider, priority, trustedFor: [...new Set(trustedFor)] }
     this.providers.push(registration)
     this.providers.sort((left, right) => right.priority - left.priority || left.id.localeCompare(right.id))
     return () => {
@@ -153,26 +188,35 @@ export class DecisionCoordinator {
     state: unknown,
     signal: AbortSignal,
     customQuestions?: readonly JevQuestion[],
+    executionContext: DecisionExecutionContext = {},
   ): Promise<DecisionResult & { readonly stateHash: string; readonly questionSetVersion: string; readonly degraded?: string }> {
     const questions = customQuestions ?? questionsFor(purpose)
-    const stateHash = sha256(stableStringify(sanitizeState(state, this.config.sendPaths === true)))
+    const sanitizedState = sanitizeState(state, this.config.sendPaths === true)
+    const stateHash = sha256(stableStringify(sanitizedState))
     if (this.config.mode === 'off') {
-      const result = await this.staticProvider.evaluate({ purpose, state, questions, signal })
-      return { ...result, providerId: result.providerId ?? 'static-offline', stateHash, questionSetVersion: this.config.questionSetVersion }
+      const result = await this.staticProvider.evaluate({ purpose, state: sanitizedState, questions, signal })
+      return { ...result, providerId: 'static-offline', trustedFor: [], stateHash, questionSetVersion: this.config.questionSetVersion }
     }
     const failures: string[] = []
     for (const registration of this.providers) {
       try {
-        const result = await registration.provider.evaluate({ purpose, state, questions, signal })
+        const result = await registration.provider.evaluate({
+          purpose, state: sanitizedState, questions, signal,
+          ...(executionContext.parentAgent === undefined ? {} : { parentAgent: executionContext.parentAgent }),
+        })
         validateDecisionResult(result, questions)
         const threshold = this.config.minConfidence?.[purpose] ?? 0
         const confidence = decisionConfidence(result)
         if (threshold > 0 && (confidence === undefined || confidence < threshold)) {
           throw new Error(`confidence ${confidence === undefined ? 'missing' : confidence.toFixed(3)} is below ${threshold.toFixed(3)}`)
         }
+        if (executionContext.requireTrustedForPurpose === true && !registration.trustedFor.includes(purpose)) {
+          throw new Error(`provider is not trusted for ${purpose}`)
+        }
         return {
           ...result,
           providerId: result.providerId ?? registration.id,
+          trustedFor: registration.trustedFor,
           stateHash,
           questionSetVersion: this.config.questionSetVersion,
         }
@@ -183,11 +227,12 @@ export class DecisionCoordinator {
     }
     const failureSummary = failures.join('; ') || 'no decision providers are registered'
     if (this.config.mode === 'required') throw new JevUnavailableError(failureSummary)
-    const fallback = await this.staticProvider.evaluate({ purpose, state, questions, signal })
+    const fallback = await this.staticProvider.evaluate({ purpose, state: sanitizedState, questions, signal })
     return {
       ...fallback,
       source: 'fallback',
       providerId: 'static-fallback',
+      trustedFor: [],
       stateHash,
       questionSetVersion: this.config.questionSetVersion,
       degraded: failureSummary,
@@ -201,6 +246,8 @@ export class DecisionCoordinator {
  */
 export function questionsFor(purpose: DecisionPurpose): readonly JevQuestion[] {
   switch (purpose) {
+    case 'intent':
+      return [{ id: 'mode', type: 'choice', text: 'Select the AutoDev engineering mode that best matches the user request.', choices: ['EXPLORE', 'IMPACT', 'DEV', 'DEBUG', 'DATABASE', 'REFACTOR', 'TEST', 'REVIEW', 'RELEASE'] }]
     case 'agent-route':
       return [{ id: 'provider', type: 'choice', text: 'Choose one eligible provider.', choices: [] }]
     case 'failure-action':
@@ -280,6 +327,10 @@ function parseAnswer(question: JevQuestion, value: unknown): DecisionAnswer {
 
 /** Keep model output inside the finite question contract before policy code sees it. */
 function validateDecisionResult(result: DecisionResult, questions: readonly JevQuestion[]): void {
+  if (!DECISION_SOURCES.includes(result.source)) throw new Error('Jev result has an unsupported decision source')
+  if (typeof result.modelVersion !== 'string' || result.modelVersion.trim() === '' || result.modelVersion.length > 256) {
+    throw new Error('Jev result has an invalid or unbounded model version')
+  }
   if (!Array.isArray(result.answers) || result.answers.length !== questions.length) {
     throw new Error('Jev result did not answer every configured question')
   }
@@ -313,16 +364,19 @@ function decisionConfidence(result: DecisionResult): number | undefined {
   return Math.min(...probabilities as number[])
 }
 
-function sanitizeState(value: unknown, sendPaths: boolean, depth = 0): unknown {
+function sanitizeState(value: unknown, sendPaths: boolean, depth = 0, fieldName?: string): unknown {
   if (depth > 5 || value === null || typeof value === 'boolean' || typeof value === 'number') return value
-  if (typeof value === 'string') return value.length > 2_000 ? `${value.slice(0, 2_000)}…` : value
+  if (typeof value === 'string') {
+    const maxChars = fieldName === 'candidateDiff' ? 24_000 : 2_000
+    return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value
+  }
   if (Array.isArray(value)) return value.slice(0, 30).map(item => sanitizeState(item, sendPaths, depth + 1))
   if (isRecord(value)) {
     const result: Record<string, unknown> = {}
     for (const [key, child] of Object.entries(value).slice(0, 80)) {
       if (!sendPaths && /path|cwd|home|directory/i.test(key)) continue
       if (/key|token|secret|password|credential/i.test(key)) continue
-      result[key] = sanitizeState(child, sendPaths, depth + 1)
+      result[key] = sanitizeState(child, sendPaths, depth + 1, key)
     }
     return result
   }

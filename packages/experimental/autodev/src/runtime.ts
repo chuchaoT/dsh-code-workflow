@@ -12,6 +12,7 @@ import type {
   AutoDevBackupManifest,
   AutoDevCleanupJobView,
   AutoDevAuditActor,
+  AutoDevMode,
   AutoDevConfig,
   AutoDevRetentionPreview,
   AutoDevSnapshot,
@@ -20,6 +21,7 @@ import type {
   BusinessConcept,
   CandidateRevision,
   CreateRunRequest,
+  DecisionPipelineConfig,
   DecisionPurpose,
   EnvironmentFingerprint,
   ExecuteRetentionCleanupRequest,
@@ -50,7 +52,9 @@ import type {
 import { HarnessCommandExecutor, type CommandExecutor, type CommandResult } from './command.ts'
 import { commandForDriver, detectBuildDrivers, selectBuildDriver, type DriverSettings } from './drivers.ts'
 import { GitManager, GitPromotionError, GitWorktreeCleanupError } from './git.ts'
-import { answerOf, DecisionCoordinator, JevUnavailableError, type DecisionProvider } from './jev.ts'
+import { answerOf, DecisionCoordinator, JevUnavailableError, questionsFor, type DecisionProvider, type DecisionProviderRegistration } from './jev.ts'
+import { OllamaDecisionProvider } from './ollama-decision.ts'
+import { SubagentDecisionProvider } from './subagent-decision.ts'
 import { ProviderRouter, type CustomProvider } from './router.ts'
 import { AgentProtocol, isValidAgentSignalEnvelope, MAX_AGENT_CONTEXT_CHARS, normalizeSignal, type AutoDevAgentContext, type AgentSignalEnvelope, type AgentTask } from './protocol.ts'
 import { AutoDevStore, defaultDataRoot } from './store.ts'
@@ -162,7 +166,7 @@ export class AutoDevRuntime extends TypertRemoteService {
     this.store = options.store ?? new AutoDevStore(this.config.dataRoot)
     this.commands = options.commands ?? new HarnessCommandExecutor(getService<SubprocessRuntime>(ctx, 'subprocess'))
     this.git = new GitManager(this.commands, this.config.worktreeRoot)
-    this.decisions = options.decisions ?? new DecisionCoordinator({ config: this.config.jev })
+    this.decisions = options.decisions ?? createDecisionCoordinator(ctx, this.config)
     this.router = new ProviderRouter({
       ...(this.config.routes === undefined ? {} : { routes: this.config.routes }),
       decisions: this.decisions,
@@ -1108,13 +1112,14 @@ export class AutoDevRuntime extends TypertRemoteService {
    * @param signal - Optional cancellation signal for repository inspection.
    * @returns The new Run's authoritative snapshot.
    */
-  async create(request: CreateRunRequest, signal?: AbortSignal): Promise<AutoDevSnapshot> {
+  async create(request: CreateRunRequest, signal?: AbortSignal, parentAgent?: unknown): Promise<AutoDevSnapshot> {
     const requestText = requireText(request.request, 'request')
     const baseline = await this.git.inspect(request.repoPath, signal)
     if (!baseline.clean) {
       throw new Error(`target repository has uncommitted changes; AutoDev requires a clean baseline:\n${baseline.status.join('\n')}`)
     }
-    const selectedMode = resolveAutoDevMode(request.mode, requestText)
+    const modeSelection = await this.selectRunMode(request.mode, requestText, signal, parentAgent)
+    const selectedMode = modeSelection.selected
     const configuredDriver = request.buildDriver ?? this.config.buildDriver
     const detectedDrivers = detectBuildDrivers(baseline.repoRoot)
     const mayOmitDriver = isReadOnlyMode(selectedMode.mode) || (baseline.kind === 'unborn' && detectedDrivers.length === 0 && configuredDriver === 'auto')
@@ -1181,7 +1186,45 @@ export class AutoDevRuntime extends TypertRemoteService {
       })
       this.store.updateRun(id, current => ({ ...current, activePlanId: plan.id, updatedAt: new Date().toISOString() }))
     })
+    if (modeSelection.decision !== undefined) {
+      const result = modeSelection.decision
+      this.recordJev(id, 'intent', result, 'accepted', `AutoDev mode ${selectedMode.mode} selected by ${result.providerId ?? result.source}`)
+    } else if (modeSelection.error !== undefined) {
+      this.store.saveEvidence({
+        id: randomUUID(), runId: id, type: 'JEV_DECISION', status: 'WARN',
+        summary: `intent classification unavailable; deterministic mode ${selectedMode.mode} used: ${modeSelection.error}`,
+        createdAt: new Date().toISOString(),
+      })
+    }
     return this.snapshot(id)
+  }
+
+  private async selectRunMode(
+    requested: CreateRunRequest['mode'],
+    request: string,
+    signal?: AbortSignal,
+    parentAgent?: unknown,
+  ): Promise<{
+    readonly selected: ReturnType<typeof resolveAutoDevMode>
+    readonly decision?: Awaited<ReturnType<DecisionCoordinator['evaluate']>>
+    readonly error?: string
+  }> {
+    const deterministic = resolveAutoDevMode(requested, request)
+    if (deterministic.source === 'explicit' || this.config.decisions === undefined) return { selected: deterministic }
+    const decisionSignal = signal ?? new AbortController().signal
+    try {
+      const result = await this.decisions.evaluate(
+        'intent', { request }, decisionSignal, questionsFor('intent'), { parentAgent },
+      )
+      const mode = answerOf(result, 'mode')?.value
+      if (result.trustedFor?.includes('intent') !== true || typeof mode !== 'string') {
+        throw new Error('no trusted decision provider returned a confident AutoDev mode')
+      }
+      return { selected: { mode: mode as AutoDevMode, source: 'auto' }, decision: result }
+    } catch (error: unknown) {
+      if (signal?.aborted) throw error
+      return { selected: deterministic, error: errorMessage(error) }
+    }
   }
 
   /** Read the current authoritative snapshot for a Run.
@@ -1211,10 +1254,16 @@ export class AutoDevRuntime extends TypertRemoteService {
    * @param id Stable provider identifier for audit records.
    * @param provider Typed decision adapter.
    * @param priority Higher values are tried before the configured default Jev endpoint.
+   * @param trustedFor Optional Host-assigned decision purposes; providers cannot grant themselves trust.
    * @returns Disposer that removes only this exact registration.
    */
-  registerDecisionProvider(id: string, provider: DecisionProvider, priority: number = 0): () => void {
-    return this.decisions.registerProvider(id, provider, priority)
+  registerDecisionProvider(
+    id: string,
+    provider: DecisionProvider,
+    priority: number = 0,
+    trustedFor: readonly DecisionPurpose[] = [],
+  ): () => void {
+    return this.decisions.registerProvider(id, provider, priority, trustedFor)
   }
 
   /** Add a candidate backed by a Provider already loaded by Harness, such as an ACP subagent.
@@ -1318,21 +1367,21 @@ export class AutoDevRuntime extends TypertRemoteService {
         await this.executeTest(run.id, worktreePath, operationSignal)
         operationSignal.throwIfAborted()
       }
-      if (!isReadOnlyMode(run.mode ?? 'DEV') && !await this.executeQuality(run.id, operationSignal)) return this.snapshot(run.id)
+      if (!isReadOnlyMode(run.mode ?? 'DEV') && !await this.executeQuality(run.id, operationSignal, parentAgent)) return this.snapshot(run.id)
       operationSignal.throwIfAborted()
-      await this.executeCompletion(run.id, operationSignal)
+      await this.executeCompletion(run.id, operationSignal, parentAgent)
       return this.snapshot(run.id)
     } catch (error: unknown) {
       if (error instanceof InterventionRequiredError) {
         this.openGate(run.id, error.message, error.options)
       } else if (error instanceof JevUnavailableError) {
-        this.openGate(run.id, `Jev is required but unavailable: ${error.message}`, ['retry', 'rework', 'cancel'])
+        this.openGate(run.id, `no configured decision provider could produce a trusted result: ${error.message}`, ['retry', 'rework', 'cancel'])
       } else if (isAbort(error, operationSignal)) {
         this.settleInterruptedRun(runId, 'Run execution was interrupted; inspect the retained Worktree before resuming')
       } else {
         const message = errorMessage(error)
         this.transitionIfAllowed(run.id, 'FAILED', { lastError: message })
-        const gate = await this.failureGate(run.id, message, error, operationSignal)
+        const gate = await this.failureGate(run.id, message, error, operationSignal, parentAgent)
         if (operationSignal.aborted) {
           this.settleInterruptedRun(runId, 'Run execution was interrupted while resolving a failure; inspect the retained Worktree before resuming')
         } else {
@@ -1637,7 +1686,7 @@ export class AutoDevRuntime extends TypertRemoteService {
       mode,
       acceptanceCriteria: run.acceptanceCriteria,
       availableProviders: this.router.list(),
-    }, readOnly ? ['read-only'] : ['code-edit', 'local-workspace'], signal)
+    }, readOnly ? ['read-only'] : ['code-edit', 'local-workspace'], signal, { parentAgent })
     if (selection.candidate === undefined) {
       const detail = readOnly ? 'no eligible read-only Agent Provider is loaded' : 'no eligible Coding Agent Provider is loaded'
       this.failNode(execution, detail)
@@ -1904,7 +1953,7 @@ export class AutoDevRuntime extends TypertRemoteService {
     this.completeNode(execution, undefined, after)
   }
 
-  private async executeCompletion(runId: string, signal: AbortSignal): Promise<void> {
+  private async executeCompletion(runId: string, signal: AbortSignal, parentAgent?: unknown): Promise<void> {
     this.transition(runId, 'VERIFY')
     const run = this.requireRun(runId)
     const verification = this.recordVerification(runId)
@@ -1922,7 +1971,9 @@ export class AutoDevRuntime extends TypertRemoteService {
       acceptanceCriteria: run.acceptanceCriteria,
       evidence: this.store.listEvidence(runId).map(item => ({ type: item.type, status: item.status, summary: item.summary })),
       candidateTree: candidate?.gitTreeHash,
-    }, signal)
+    }, signal, undefined, {
+      ...(parentAgent === undefined ? {} : { parentAgent }),
+    })
     this.recordJev(runId, 'completion', result, result.degraded === undefined ? 'accepted' : 'degraded', result.degraded ?? 'completion decision recorded')
     const answer = answerOf(result, 'completion')
     if (answer?.value === 'work_remaining' || answer?.value === 'human_review') {
@@ -2088,7 +2139,7 @@ export class AutoDevRuntime extends TypertRemoteService {
    * Build/Test checks. The score can only add review work; it can never turn a
    * failed deterministic check into a pass.
    */
-  private async executeQuality(runId: string, signal: AbortSignal): Promise<boolean> {
+  private async executeQuality(runId: string, signal: AbortSignal, parentAgent?: unknown): Promise<boolean> {
     const run = this.requireRun(runId)
     const candidate = run.candidateId === undefined ? undefined : this.store.getCandidate(run.candidateId)
     const evidence = this.store.listEvidence(runId)
@@ -2101,12 +2152,18 @@ export class AutoDevRuntime extends TypertRemoteService {
       candidateDiff: diffText,
       candidateDiffTruncated: diffArtifact !== undefined && diffArtifact.bytes > 24_000,
       evidence: evidence.map(item => ({ type: item.type, status: item.status, summary: item.summary })),
-    }, signal)
+    }, signal, undefined, {
+      ...(parentAgent === undefined ? {} : { parentAgent }),
+      requireTrustedForPurpose: true,
+    })
     this.recordJev(runId, 'quality', result, result.degraded === undefined ? 'accepted' : 'degraded', result.degraded ?? 'quality decision recorded')
     const score = answerOf(result, 'score')?.value
     // Missing or malformed review intent is not an approval. Only an explicit false may pass.
     const needsReview = answerOf(result, 'needs_review')?.value !== false
-    const trustedReview = result.source === 'jev'
+    const trustedReview = result.trustedFor?.includes('quality') === true
+    const reviewSource = trustedReview && ['jev', 'local-model', 'subagent'].includes(result.source)
+      ? result.source as 'jev' | 'local-model' | 'subagent'
+      : 'system'
     const scorePass = trustedReview && typeof score === 'number' && score >= this.config.qualityMinScore
     const reviewStatus = scorePass && !needsReview ? 'PASS' : 'WARN'
     this.store.saveEvidence({
@@ -2116,17 +2173,17 @@ export class AutoDevRuntime extends TypertRemoteService {
       type: 'REVIEW',
       planId: this.activePlan(run).id,
       status: reviewStatus,
-      source: trustedReview ? 'jev' : 'system',
+      source: reviewSource,
       ...(candidate === undefined ? {} : { candidateId: candidate.id, gitTreeHash: candidate.gitTreeHash }),
       summary: typeof score === 'number'
-        ? `${trustedReview ? 'Jev' : 'Untrusted fallback'} quality score ${score}/${100}; minimum ${this.config.qualityMinScore}${needsReview ? '; additional human review requested' : ''}${trustedReview ? '' : '; fallback output cannot approve code review'}`
-        : 'Jev quality score was not available; human review is required',
+        ? `${trustedReview ? `${result.source} (${result.providerId ?? 'configured provider'})` : 'Untrusted decision provider'} quality score ${score}/${100}; minimum ${this.config.qualityMinScore}${needsReview ? '; additional human review requested' : ''}${trustedReview ? '' : '; this provider is not trusted to approve code review'}`
+        : 'Trusted quality score was not available; human review is required',
       createdAt: new Date().toISOString(),
     })
     this.recordVerification(runId)
     if (!scorePass || needsReview) {
       const reason = !trustedReview
-        ? 'quality review is unavailable from the configured decision service; static/advisory fallback cannot create Review PASS Evidence'
+        ? 'quality review is unavailable from a provider trusted for quality; untrusted model output cannot create Review PASS Evidence'
         : `quality review required${typeof score === 'number' ? `: score ${score}/${100}` : ''}`
       this.openGate(runId, reason, ['rework', 'replan', 'abandon', 'cancel'])
       return false
@@ -2167,6 +2224,7 @@ export class AutoDevRuntime extends TypertRemoteService {
     message: string,
     error: unknown,
     signal: AbortSignal,
+    parentAgent?: unknown,
   ): Promise<{ readonly reason: string; readonly options: HumanGate['options'] }> {
     const safeOptions: HumanGate['options'] = error instanceof ExternalOutcomeUnknownError
       ? ['rework', 'replan', 'abandon', 'cancel']
@@ -2178,7 +2236,9 @@ export class AutoDevRuntime extends TypertRemoteService {
         error: message,
         safeActions: safeOptions,
         evidence: this.store.listEvidence(runId).slice(-8).map(item => ({ type: item.type, status: item.status })),
-      }, signal)
+      }, signal, undefined, {
+        ...(parentAgent === undefined ? {} : { parentAgent }),
+      })
       this.recordJev(runId, 'failure-action', result, result.degraded === undefined ? 'accepted' : 'degraded', result.degraded ?? 'failure action recorded')
       const value = answerOf(result, 'action')?.value
       if (typeof value === 'string' && ['retry_same', 'rework', 'replan', 'human', 'stop'].includes(value)) suggested = value as FailureAction
@@ -2207,7 +2267,7 @@ export class AutoDevRuntime extends TypertRemoteService {
           ? safeOptions.filter(item => item === 'cancel' || item === 'abandon')
           : safeOptions
     return {
-      reason: suggested === undefined ? message : `${message}; Jev failure-action suggestion: ${suggested}`,
+      reason: suggested === undefined ? message : `${message}; decision-provider failure-action suggestion: ${suggested}`,
       options: options.length === 0 ? ['cancel'] : options,
     }
   }
@@ -2331,6 +2391,7 @@ export class AutoDevRuntime extends TypertRemoteService {
       questionSetVersion: result.questionSetVersion,
       source: result.source,
       ...(result.providerId === undefined ? {} : { providerId: result.providerId }),
+      ...(result.trustedFor === undefined ? {} : { trustedFor: result.trustedFor }),
       modelVersion: result.modelVersion,
       answer: result.answers,
       ...(first?.probability === undefined ? {} : {
@@ -2341,6 +2402,7 @@ export class AutoDevRuntime extends TypertRemoteService {
     })
     this.store.saveEvidence({
       id: randomUUID(), runId, type: 'JEV_DECISION', status: outcome === 'paused' ? 'WARN' : 'PASS',
+      source: result.source === 'static' || result.source === 'fallback' ? 'system' : result.source,
       summary: `${purpose}: ${reason}`, createdAt: new Date().toISOString(),
     })
   }
@@ -2689,6 +2751,7 @@ export interface ResolvedAutoDevConfig {
   readonly testTimeoutMs: number
   readonly qualityMinScore: number
   readonly jev: NonNullable<AutoDevConfig['jev']>
+  readonly decisions: AutoDevConfig['decisions']
   readonly routes: AutoDevConfig['routes']
   readonly buildDriver: NonNullable<AutoDevConfig['buildDriver']>
   readonly drivers: NonNullable<AutoDevConfig['drivers']>
@@ -2750,6 +2813,78 @@ function cleanupFailureCode(error: unknown): RetentionCleanupFailureCode {
   return 'git-remove-failed'
 }
 
+function createDecisionCoordinator(ctx: Context, config: ResolvedAutoDevConfig): DecisionCoordinator {
+  const pipeline = config.decisions
+  if (pipeline === undefined) return new DecisionCoordinator({ config: config.jev })
+
+  const defaults: Partial<Record<DecisionPurpose, number>> = {
+    intent: 0.72,
+    'agent-route': 0.75,
+    'failure-action': 0.85,
+    quality: 0.9,
+    completion: 0.85,
+  }
+  const providers: DecisionProviderRegistration[] = []
+  if (pipeline.ollama !== undefined && pipeline.ollama.enabled !== false) {
+    providers.push({
+      id: `ollama:${pipeline.ollama.model ?? 'qwen3:8b-fast'}`,
+      provider: new OllamaDecisionProvider(pipeline.ollama),
+      priority: 100,
+      trustedFor: ['intent', 'agent-route', 'failure-action', 'completion'],
+    })
+  }
+  if ((pipeline.escalationSubagents?.length ?? 0) > 0) {
+    providers.push({
+      id: 'subagent-escalation',
+      provider: new SubagentDecisionProvider(() => getService<SubagentRuntime>(ctx, 'subagents'), pipeline.escalationSubagents ?? []),
+      priority: 50,
+      trustedFor: ['intent', 'agent-route', 'failure-action', 'quality', 'completion'],
+    })
+  }
+  const minConfidence = {
+    ...defaults,
+    ...config.jev.minConfidence,
+    ...pipeline.minConfidence,
+  }
+  return new DecisionCoordinator({
+    config: {
+      ...config.jev,
+      mode: pipeline.mode ?? 'required',
+      minConfidence,
+    },
+    includeJevProvider: pipeline.useJev === true,
+    providers,
+  })
+}
+
+function validateDecisionPipelineConfig(config: DecisionPipelineConfig | undefined): DecisionPipelineConfig | undefined {
+  if (config === undefined) return undefined
+  if (config.mode !== undefined && !['required', 'advisory', 'off'].includes(config.mode)) {
+    throw new TypeError('decisions.mode must be required, advisory, or off')
+  }
+  if (config.ollama?.enabled !== undefined && typeof config.ollama.enabled !== 'boolean') {
+    throw new TypeError('decisions.ollama.enabled must be a boolean')
+  }
+  if (config.ollama?.timeoutMs !== undefined) positive(config.ollama.timeoutMs, 'decisions.ollama.timeoutMs')
+  if (config.ollama?.model !== undefined && (config.ollama.model.trim() === '' || config.ollama.model.length > 256)) {
+    throw new TypeError('decisions.ollama.model must be non-empty and bounded')
+  }
+  const subagents = config.escalationSubagents ?? []
+  if (!Array.isArray(subagents) || subagents.length > 8 || subagents.some(name => typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(name))) {
+    throw new TypeError('decisions.escalationSubagents must contain at most eight valid DSH Subagent provider names')
+  }
+  if (new Set(subagents).size !== subagents.length) throw new TypeError('decisions.escalationSubagents must not contain duplicates')
+  if (config.useJev !== undefined && typeof config.useJev !== 'boolean') throw new TypeError('decisions.useJev must be a boolean')
+  const purposes: readonly DecisionPurpose[] = ['intent', 'agent-route', 'failure-action', 'quality', 'completion']
+  for (const [purpose, threshold] of Object.entries(config.minConfidence ?? {})) {
+    if (!purposes.includes(purpose as DecisionPurpose)) throw new TypeError(`decisions.minConfidence.${purpose} is not a supported decision purpose`)
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+      throw new TypeError(`decisions.minConfidence.${purpose} must be between 0 and 1`)
+    }
+  }
+  return config
+}
+
 function resolveConfig(config: AutoDevConfig): ResolvedAutoDevConfig {
   const dataRoot = resolve(config.dataRoot ?? defaultDataRoot())
   return {
@@ -2761,6 +2896,7 @@ function resolveConfig(config: AutoDevConfig): ResolvedAutoDevConfig {
     testTimeoutMs: positive(config.testTimeoutMs ?? 10 * 60_000, 'testTimeoutMs'),
     qualityMinScore: score(config.qualityMinScore ?? 70),
     jev: config.jev ?? {},
+    decisions: validateDecisionPipelineConfig(config.decisions),
     routes: config.routes,
     buildDriver: config.buildDriver ?? 'auto',
     drivers: config.drivers ?? {},

@@ -189,7 +189,7 @@ describe('Jev boundary', () => {
     const dispose = coordinator.registerProvider('local-qwen', {
       async evaluate(request) {
         return {
-          source: 'jev', modelVersion: 'qwen3-small-fixture',
+          source: 'local-model', modelVersion: 'qwen3-small-fixture',
           answers: request.questions.map(question => ({
             questionId: question.id, kind: question.type,
             value: question.type === 'choice' ? question.choices?.[0] ?? 'ready_for_verify'
@@ -198,11 +198,12 @@ describe('Jev boundary', () => {
           })),
         }
       },
-    }, 10)
+    }, 10, ['completion'])
     try {
       const result = await coordinator.evaluate('completion', {}, new AbortController().signal)
       expect(result.providerId).toBe('local-qwen')
-      expect(result.source).toBe('jev')
+      expect(result.source).toBe('local-model')
+      expect(result.trustedFor).toEqual(['completion'])
     } finally {
       dispose()
     }

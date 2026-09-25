@@ -16,6 +16,7 @@ import { AutoDevRuntime } from '../src/runtime.ts'
 import { SemanticService } from '../src/semantics.ts'
 import { SideEffectService } from '../src/side-effects.ts'
 import { AutoDevStore } from '../src/store.ts'
+import { trustedTestDecisions } from './harness.ts'
 
 const roots: string[] = []
 
@@ -865,7 +866,7 @@ describe('Runtime signal integration', () => {
       dataRoot: state, worktreeRoot: worktrees, jev: { mode: 'off' },
       maven: { executable: 'fake-mvn', buildArgs: ['package'], testArgs: ['test'] },
       routes: { implement: { candidates: [{ kind: 'command', provider: 'semantic-editor', traits: ['code-edit', 'local-workspace'] }], requiredTaskTraits: ['code-edit', 'local-workspace'] } },
-    }, { commands: new DomainCommandExecutor() })
+    }, { commands: new DomainCommandExecutor(), decisions: trustedTestDecisions() })
     let conflictAssumptionId: string | undefined
     const capturedContexts: AutoDevAgentContext[] = []
     runtime.registerProvider({
@@ -1038,7 +1039,7 @@ describe('Runtime signal integration', () => {
       dataRoot: state, worktreeRoot: worktrees, jev: { mode: 'off' },
       maven: { executable: 'fake-mvn', buildArgs: ['package'], testArgs: ['test'] },
       routes: { implement: { candidates: [{ kind: 'command', provider: 'lifecycle-editor', traits: ['code-edit', 'local-workspace'] }], requiredTaskTraits: ['code-edit', 'local-workspace'] } },
-    }, { commands: new DomainCommandExecutor() })
+    }, { commands: new DomainCommandExecutor(), decisions: trustedTestDecisions() })
     const capturedContexts: AutoDevAgentContext[] = []
     runtime.registerProvider({
       name: 'lifecycle-editor', kind: 'command', traits: ['code-edit', 'local-workspace'], workspaceCwd: true,

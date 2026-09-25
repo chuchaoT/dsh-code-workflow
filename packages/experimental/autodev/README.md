@@ -52,7 +52,7 @@ The Bundle adds one Host-owned workflow and a client view to a DSH profile:
 - Nine explicit/auto-detected work modes, separated from workflow lifecycle states; read-only modes do not require a build driver or code Candidate.
 - Project-scoped Memory, Business Concepts, Assumptions, Semantic Uncertainty, versioned Playbooks, and evidence-backed Knowledge evolution.
 - Model tools for runs, Gates, retrieval, correction, regression checks, and compaction; a Web sidebar shows run snapshots and bounded Candidate diffs, with side-by-side comparison of two revisions from the same Run and their verification evidence.
-- Optional Jev/local decision-provider chain with `required`, `advisory`, and `off` modes; deterministic fallback decisions cannot create a Review PASS or override failed Build/Test Evidence.
+- Optional decision-provider chain with native local Ollama support and optional Jev/Subagent escalation; decisions are confidence-bounded and Host-assigned trust prevents an untrusted provider from approving a quality review.
 
 The Host derives the project key from the inspected Git repository. Optional module, branch, language, project-version, schema-version, and tech-stack-version fields narrow knowledge scope; callers cannot use them to redirect a Run to another project.
 
@@ -62,15 +62,46 @@ The existing `DecisionProvider` contract can be extended without replacing the r
 
 ```ts
 import type { DecisionProvider } from '@deepseek-ai/dsh-experimental-autodev'
+import type { DecisionPurpose } from '@deepseek-ai/dsh-experimental-autodev/contracts'
 
-declare const ctx: { autodev: { registerDecisionProvider(id: string, provider: DecisionProvider, priority?: number): () => void } }
+declare const ctx: { autodev: { registerDecisionProvider(id: string, provider: DecisionProvider, priority?: number, trustedFor?: readonly DecisionPurpose[]): () => void } }
 declare const localModelAdapter: DecisionProvider
 
 const removeLocalModel = ctx.autodev.registerDecisionProvider('local-qwen', localModelAdapter, 20)
-// Call removeLocalModel() when the contributing Bundle unloads.
+// Call this disposer when the contributing Bundle unloads.
 ```
 
-Higher priorities are tried first. Invalid, low-confidence (when configured), or unavailable providers fall through to the next; `required` fails if none succeeds, while `advisory` uses the explicitly untrusted static fallback. A provider must identify an actual model-backed decision as `source: 'jev'`; rule/static adapters must not claim that source. Quality Review PASS additionally requires a valid score above policy and an explicit `needs_review: false`. Code-run quality decisions include up to 24,000 bytes of Candidate Diff, which may contain proprietary source; confirm the configured remote Jev backend's data-handling boundary before enabling it. Path sharing remains separately controlled by `sendPaths`. Provider probability is not assumed calibrated unless a confidence threshold is configured. This seam does not bundle a Qwen model or connect DSH's Ollama endpoint automatically.
+Higher priorities are tried first. Invalid, low-confidence, or unavailable providers fall through to the next; `required` fails closed when no provider can answer, while `advisory` uses an explicitly untrusted static fallback. The Host assigns each registered provider's `trustedFor` purposes; a provider cannot grant itself trust by setting its result source. Quality Review PASS requires a provider trusted for `quality`, a valid score above policy, and `needs_review: false`. Quality review can include up to 24,000 bytes of Candidate Diff, which may contain proprietary source; enabling a remote Jev or Subagent can send that bounded diff outside the machine. Provider probability is self-reported and is not assumed calibrated.
+
+### Local Ollama decision chain
+
+AutoDev has a first-party Ollama adapter for the native `/api/chat` endpoint. It is opt-in, does not need an API key, and defaults to `qwen3:8b-fast`. Jev availability is configured separately: `jev.mode: off` disables remote Jev without disabling an explicitly configured decision chain.
+
+```yaml
+- name: '@deepseek-ai/dsh-experimental-autodev'
+  config:
+    jev:
+      mode: off
+    decisions:
+      mode: required
+      ollama:
+        enabled: true
+        endpoint: http://127.0.0.1:11434/api/chat
+        model: qwen3:8b-fast
+        timeoutMs: 60000
+      escalationSubagents: [codex, claude-code, spawn]
+      useJev: false
+      minConfidence:
+        intent: 0.72
+        agent-route: 0.75
+        failure-action: 0.85
+        quality: 0.9
+        completion: 0.85
+```
+
+With this configuration, Ollama handles bounded mode, route, recovery, and completion choices. Low confidence or provider failure advances to the listed `ctx.subagents` providers, in order. Escalation requires a live parent DSH Agent and a provider that honors an isolated working directory; it receives the bounded decision input and a fresh empty temporary directory, not the Candidate Worktree. When a provider supports DSH tool filtering, AutoDev removes all global tools for this decision call. External Codex/Claude-style providers may have their own native tools, however, and a temporary working directory is not an OS sandbox; do not treat it as a hard security boundary. The bounded diff can also contain proprietary code. An exhausted chain during Run execution fails closed into the existing Human Gate. During initial mode classification, AutoDev instead records a warning and uses its conservative deterministic classifier; the Plan still requires explicit human approval before execution. Only Jev or an explicitly configured Subagent is trusted to pass `quality`; the local Qwen answer alone can never produce Review PASS. Explicit modes supplied by the user always override auto-classification.
+
+The generic `registerDecisionProvider` API remains available for custom bundles. It accepts an optional Host-assigned `trustedFor` list; omit it unless that bundle is deliberately trusted for those purposes. These decision adapters do not install Ollama or expose Ollama as a code-editing Agent.
 
 ### Add a Provider or route
 
@@ -178,7 +209,7 @@ For a self-hosted [FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi) gate
           - id: <model-id-from-v1-models>
 ```
 
-The OpenAI-compatible client requires a credential value even when the local Ollama server ignores it, so keep the placeholder in DSH's credential mechanism rather than a checked-in profile. Ollama and FreeLLMAPI supply model inference; they do not provide a coding Agent's workspace tools, execution lifecycle, or AutoDev Evidence. Run an Ollama-backed Agent through a DSH Agent composition (for example, a `spawn` child inheriting a Session configured for `ollama-local`), while CodeBuddy remains an ACP Agent candidate. The route seam is extensible, but live endpoint and Agent end-to-end verification remain release checks.
+The OpenAI-compatible client requires a credential value even when the local Ollama server ignores it, so keep the placeholder in DSH's credential mechanism rather than a checked-in profile. That setup is separate from AutoDev's local decision adapter above: Ollama and FreeLLMAPI supply model inference but do not provide a coding Agent's workspace tools, execution lifecycle, or AutoDev Evidence. Run an Ollama-backed coding Agent through a DSH Agent composition (for example, a `spawn` child inheriting a Session configured for `ollama-local`), while CodeBuddy remains an ACP Agent candidate.
 
 <a id="work-modes-and-execution-environment"></a>
 ### Work modes and execution environment
@@ -189,7 +220,7 @@ Work mode answers “what engineering strategy should this Run use?” Workflow 
 | --- | --- | --- |
 | `EXPLORE` | Understand repository structure and behavior | Read-only Agent analysis |
 | `IMPACT` | Trace dependencies and change impact | Read-only Agent analysis |
-| `DEV` | Implement a normal requirement | Implement → optional Build → optional Test → Jev quality review |
+| `DEV` | Implement a normal requirement | Implement → optional Build → optional Test → trusted decision-provider quality review |
 | `DEBUG` | Find root cause, fix, and regress | Implement/fix → optional Build/Test → quality review |
 | `DATABASE` | Make schema/migration changes safely | Implement → optional Build/Test → quality review |
 | `REFACTOR` | Refactor while preserving behavior | Implement → optional Build/Test → quality review |
@@ -347,7 +378,7 @@ Project records and retrieval results can change these supplemental cards betwee
 - On Windows, Maven and Gradle run through their standard Wrapper JARs using direct `java.exe` argv; AutoDev never executes `.cmd`/`.bat` wrappers. A wrapper JAR is required unless a directly executable custom binary is configured. The shell-free launch path has a Java-backed wrapper smoke test, but this does not certify a real Maven or Gradle project build.
 - The sidebar can create, review, and approve Plans; start or rework a Run through a DSH Session whose working directory matches the repository; invoke every currently allowed Human Gate action; resolve semantic uncertainties; confirm, invalidate, or mark assumptions unknown; version human Business Concept corrections; review Knowledge merge proposals; manage Knowledge regression cases and suites; promote a Candidate only with trusted PASS Evidence and fresh passing regressions; inspect compaction reports and restore only while recorded versions remain unchanged; and create, revise, activate, or deprecate versioned Playbooks. It can also compare two Candidate revisions from the same Run side by side, including each revision's Diff, Plan/Attempt/tree metadata, Verification, and Candidate Evidence. Knowledge promotion and compaction require explicit confirmation, while the Host remains authoritative for scope, freshness, and state changes. Plan re-review is required after semantic or Playbook changes, and Host rejects those changes during active execution. Assumption confirmation requires selecting current-Run trusted PASS Evidence, with Host-side validation remaining authoritative. Run Promotion has a second confirmation with Candidate, verification, and Evidence summary. Authenticated DSH Web and real official Codex/Claude Code execution are still unverified; browser E2E and approval-actor identity remain release gates.
 - Knowledge mutation tools use the DSH tool-call ID as an idempotency key: replaying the same committed call returns the current snapshot without writing twice, while a new explicit call can create a new regression case, suite result, or compaction report. The UI similarly assigns a unique operation ID per confirmed action; retrying a failed operation requires a new ID.
-- CodeBuddy and Ollama require separately installed adapters. The generic registration contract does not imply first-party support.
+- CodeBuddy execution still requires its DSH ACP Provider. AutoDev's local Ollama decision adapter is first-party and its localhost smoke test is covered, but a full Run using real Coding Agent providers remains an external integration check; this is distinct from using Ollama itself as a code-editing Agent.
 - Promotion is intentionally explicit. A changed baseline, changed Candidate, missing Evidence, or unresolved Gate blocks writes to the original checkout.
 
 <a id="dev-note"></a>

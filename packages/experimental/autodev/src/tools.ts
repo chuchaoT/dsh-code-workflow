@@ -2,7 +2,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { AutoDevConfig, AutoDevSnapshot, BuildDriverId } from './contracts.ts'
+import type { AutoDevConfig, AutoDevMode, AutoDevSnapshot, BuildDriverId } from './contracts.ts'
 import { AutoDevRuntime } from './runtime.ts'
 
 const JSON_OUTPUT = {
@@ -59,6 +59,7 @@ function createTool(runtime: AutoDevRuntime) {
     parameters: {
       repo_path: { type: 'string', required: true, description: 'Absolute path to the target Git repository.' },
       request: { type: 'string', required: true, description: 'The software change to implement.' },
+      mode: { type: 'string', enum: ['AUTO', 'EXPLORE', 'IMPACT', 'DEV', 'DEBUG', 'DATABASE', 'REFACTOR', 'TEST', 'REVIEW', 'RELEASE'], description: 'Optional explicit engineering mode. AUTO or omission enables intent classification; an explicitly selected mode always wins.' },
       acceptance_criteria: { type: 'array', items: { type: 'string' }, description: 'Optional explicit acceptance checks.' },
       build_driver: { type: 'string', enum: ['maven', 'gradle', 'node', 'pytest'], description: 'Optional driver when the repository root contains more than one supported project marker.' },
       goal_id: { type: 'string', description: 'Optional existing DSH Goal id; Goal remains distinct from this execution Run.' },
@@ -81,11 +82,12 @@ function createTool(runtime: AutoDevRuntime) {
       return await runtime.create({
         repoPath: args.repo_path,
         request: args.request,
+        ...(args.mode === undefined ? {} : { mode: args.mode as AutoDevMode | 'AUTO' }),
         ...(args.acceptance_criteria === undefined ? {} : { acceptanceCriteria: args.acceptance_criteria }),
         ...(args.build_driver === undefined ? {} : { buildDriver: args.build_driver as BuildDriverId }),
         ...(args.goal_id === undefined ? {} : { goalId: args.goal_id }),
         ...(args.scope === undefined ? {} : { scope: args.scope }),
-      }, exec.signal) as never
+      }, exec.signal, exec.agent) as never
     },
     presentCall: args => ({ card: 'generic', title: 'Create AutoDev run', kind: 'other', rawInput: args.repo_path }),
   })

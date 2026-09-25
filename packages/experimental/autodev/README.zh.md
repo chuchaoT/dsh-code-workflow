@@ -52,7 +52,7 @@ pnpm dsh plugin --profile autodev remove @deepseek-ai/dsh-experimental-autodev
 - 支持九种显式或自动识别的工作模式，并与 Run 生命周期状态分离；只读模式不要求构建驱动或代码 Candidate。
 - 按项目隔离的 Memory、Business Concept、Assumption、Semantic Uncertainty、版本化 Playbook 和基于证据的知识演化。
 - 用于 Run、Gate、检索、纠正、回归检查和压缩的模型工具；Web Sidebar 展示 Run 快照和受限 Candidate Diff，并可并排比较同一 Run 的两个版本及其验证证据。
-- 可扩展的 Jev/本地决策 Provider 链，支持 `required`、`advisory`、`off` 模式；静态降级决策不能伪造 Review PASS，也不能覆盖失败的 Build/Test Evidence。
+- 可扩展的决策 Provider 链，原生支持本地 Ollama，并可选升级到 Jev/DSH Subagent；置信度门槛和 Host 分配的信任范围防止未授权 Provider 通过质量审查。
 
 Host 从经过检查的 Git 仓库派生项目 key。可选的 module、branch、language、project-version、schema-version、tech-stack-version 字段可缩小知识作用域；调用方不能通过这些字段将 Run 指向其他项目。
 
@@ -62,15 +62,46 @@ Host 从经过检查的 Git 仓库派生项目 key。可选的 module、branch�
 
 ```ts
 import type { DecisionProvider } from '@deepseek-ai/dsh-experimental-autodev'
+import type { DecisionPurpose } from '@deepseek-ai/dsh-experimental-autodev/contracts'
 
-declare const ctx: { autodev: { registerDecisionProvider(id: string, provider: DecisionProvider, priority?: number): () => void } }
+declare const ctx: { autodev: { registerDecisionProvider(id: string, provider: DecisionProvider, priority?: number, trustedFor?: readonly DecisionPurpose[]): () => void } }
 declare const localModelAdapter: DecisionProvider
 
 const removeLocalModel = ctx.autodev.registerDecisionProvider('local-qwen', localModelAdapter, 20)
-// Bundle 卸载时调用 removeLocalModel()
+// Call this disposer when the contributing Bundle unloads.
 ```
 
-优先级较高的 Provider 先运行；不可用、答案无效或低置信度（仅在配置阈值时）会继续尝试后续 Provider。`required` 模式在全部失败时中止，`advisory` 模式使用明确标记为不可信的静态兜底。只有真实模型决策才应返回 `source: 'jev'`；规则或静态适配器不能冒用。质量审查只有在分数达标且明确返回 `needs_review: false` 时才能生成 Review PASS。代码类 Run 的质量决策会附带最多 24,000 字节的 Candidate Diff；这可能包含私有源码，启用远程 Jev 前应确认数据处理边界。路径是否发送仍由 `sendPaths` 单独控制。除非显式配置置信度阈值，否则不会假设模型概率已经校准。该扩展点不会自动打包 Qwen 模型，也不会自动接通 DSH 的 Ollama Endpoint。
+优先级较高的 Provider 先运行；不可用、答案无效或低置信度会继续尝试后续 Provider。`required` 模式在没有可接受结果时 fail closed，`advisory` 模式会使用明确标记为不可信的静态兜底。每个 Provider 的 `trustedFor` 由 Host 分配，Provider 不能通过自报结果来源来取得信任。质量审查只有在 Provider 被信任处理 `quality`、分数达标且明确返回 `needs_review: false` 时才能生成 Review PASS。质量审查最多会收到 24,000 字节 Candidate Diff；其中可能包含私有源码，启用远程 Jev 或 Subagent 前应确认数据边界。Provider 返回的概率是自评值，不能默认视为经过校准。
+
+### 本地 Ollama 决策链
+
+AutoDev 已有调用 Ollama 原生 `/api/chat` 的一方适配器。该能力需显式启用、不需要 API Key，默认模型为 `qwen3:8b-fast`。它与 Jev 分开配置：`jev.mode: off` 关闭远程 Jev，但不会关闭显式配置的本地决策链。
+
+```yaml
+- name: '@deepseek-ai/dsh-experimental-autodev'
+  config:
+    jev:
+      mode: off
+    decisions:
+      mode: required
+      ollama:
+        enabled: true
+        endpoint: http://127.0.0.1:11434/api/chat
+        model: qwen3:8b-fast
+        timeoutMs: 60000
+      escalationSubagents: [codex, claude-code, spawn]
+      useJev: false
+      minConfidence:
+        intent: 0.72
+        agent-route: 0.75
+        failure-action: 0.85
+        quality: 0.9
+        completion: 0.85
+```
+
+在此配置下，Ollama 负责有限的模式、路由、故障恢复和完成状态选择。置信度不足或本地 Provider 失败时，按顺序升级到列表中的 `ctx.subagents` Provider。升级需要活跃的父 DSH Agent，以及支持隔离工作目录的子代理；它收到有界决策输入和一个全新的空临时目录，不会直接拿到 Candidate Worktree。若 Provider 支持 DSH 工具过滤，本次调用会移除所有全局工具。但 Codex/Claude 一类外部 Agent 仍可能有其自身的原生工具，临时工作目录也不是操作系统沙箱，不能把它当作硬安全边界；有界 Diff 同样可能包含私有代码。Run 执行期间若决策链全部失败，则 fail closed 并进入现有 Human Gate。初始模式识别失败时，则记录警告并使用保守的确定性分类器；Plan 在人工明确批准前仍不能执行。只有 Jev 或显式配置且被信任的 Subagent 可以通过 `quality`；本地 Qwen 单独不能生成 Review PASS。用户明确指定的模式始终优先，不会被自动识别覆盖。
+
+通用 `registerDecisionProvider` API 仍可供自定义 Bundle 使用，并支持可选的 Host 信任范围 `trustedFor`；除非 Bundle 明确需要承担相应决策职责，否则不要设置它。该决策适配器不会安装 Ollama，也不会把 Ollama 伪装成可编辑代码的 Agent。
 
 ### 添加 Provider 或路由
 
@@ -178,7 +209,7 @@ OpenAI 兼容的模型端点可以复用 DSH 已有的 `@deepseek-ai/dsh-llm-pi-
           - id: <model-id-from-v1-models>
 ```
 
-OpenAI 兼容客户端即使连接到忽略认证的本地 Ollama 服务，也要求传入一个 credential 值；应将占位凭据放入 DSH 凭据机制，不要写进被提交的 Profile。Ollama 和 FreeLLMAPI 提供的是模型推理，不会提供编码 Agent 所需的工作区工具、执行生命周期或 AutoDev Evidence。应通过 DSH Agent 组合运行 Ollama 模型（例如父 Session 使用 `ollama-local`，再由继承配置的 `spawn` 子 Agent 执行）；CodeBuddy 则是 ACP Agent 路由候选项。路由扩展点已存在，但真实服务端点和 Agent 全链路仍属于发布验收项。
+OpenAI 兼容客户端即使连接到忽略认证的本地 Ollama 服务，也要求传入一个 credential 值；应将占位凭据放入 DSH 凭据机制，不要写进被提交的 Profile。这里介绍的 OpenAI 兼容配置与上面的 AutoDev 本地决策适配器是两种用途：Ollama 和 FreeLLMAPI 提供模型推理，但不提供编码 Agent 所需的工作区工具、执行生命周期或 AutoDev Evidence。要把 Ollama 用作编码 Agent，应通过 DSH Agent 组合（例如父 Session 使用 `ollama-local`，再由继承配置的 `spawn` 子 Agent 执行）；CodeBuddy 仍通过 ACP 作为 Agent 路由候选项。
 
 <a id="work-modes-and-execution-environment"></a>
 ### 工作模式与执行环境
@@ -189,7 +220,7 @@ OpenAI 兼容客户端即使连接到忽略认证的本地 Ollama 服务，也�
 | --- | --- | --- |
 | `EXPLORE` | 了解仓库结构与行为 | 只读 Agent 分析 |
 | `IMPACT` | 追踪依赖关系和变更影响 | 只读 Agent 分析 |
-| `DEV` | 实现常规需求 | 实现 → 可选 Build → 可选 Test → Jev 质量审查 |
+| `DEV` | 实现常规需求 | 实现 → 可选 Build → 可选 Test → 可信决策 Provider 质量审查 |
 | `DEBUG` | 定位根因、修复并回归 | 修复 → 可选 Build/Test → 质量审查 |
 | `DATABASE` | 安全处理 Schema/Migration | 实现 → 可选 Build/Test → 质量审查 |
 | `REFACTOR` | 保持行为兼容地重构 | 实现 → 可选 Build/Test → 质量审查 |
@@ -347,7 +378,7 @@ AutoDev 将六类卡片合计限制为每次尝试 6,000 个字符，并由 Agen
 - Windows 上的 Maven 和 Gradle 通过标准 Wrapper JAR 与直接 `java.exe` argv 启动；AutoDev 不执行 `.cmd`/`.bat` 包装脚本。除非配置了可直接执行的自定义二进制，否则必须提供 Wrapper JAR。Shell-free 启动路径已有基于真实 Java 的 Wrapper 主类烟测，但这不等于真实 Maven/Gradle 工程构建验收。
 - Sidebar 可以创建、审阅并批准 Plan；通过工作目录与仓库一致的 DSH Session 启动或返工 Run；执行当前开放 Human Gate 允许的全部动作；解决语义不确定性；确认、判定失效或标记未知假设；保存带版本历史的 Business Concept 人工纠正；审阅 Knowledge 合并提案；管理 Knowledge 回归用例与套件；仅在可信 PASS Evidence 和新鲜回归通过时晋级 Candidate；查看压缩报告，并且只在记录版本未变化时恢复；还可以创建、修订、激活或弃用带版本历史的 Playbook。它也可并排比较同一 Run 中的两个 Candidate 版本，查看各自 Diff、Plan/Attempt/tree 元数据、验证状态和 Candidate Evidence。Knowledge 晋级和压缩需显式确认，作用域、新鲜度和状态变更仍由 Host 权威校验。语义或 Playbook 变更会要求重新审阅 Plan，执行中的 Run 会拒绝此类变更。确认假设必须选择属于当前 Run 的可信 PASS Evidence，Host 仍执行最终校验。Run Promotion 会二次确认，并展示 Candidate、验证和 Evidence 摘要。认证后的 DSH Web 与真实官方 Codex/Claude Code 执行仍未验收；浏览器 E2E、审批人身份记录仍是发布门禁。
 - Knowledge 写入工具以 DSH 工具调用 ID 作为幂等键：重放同一个已提交调用只返回当前快照，不会重复写入；新的显式调用则可新建回归用例、套件结果或压缩报告。UI 也会为每次确认后的操作生成唯一 ID；失败操作如需重试，必须使用新 ID。
-- CodeBuddy 和 Ollama 需要单独安装适配器。通用注册契约不代表一方正式支持。
+- CodeBuddy 执行仍需安装 DSH ACP Provider。AutoDev 的本地 Ollama 决策适配器已由项目原生提供，并通过 localhost 冒烟测试；但使用真实 Coding Agent Provider 完成完整 Run 仍属于外部集成验收，且这与直接把 Ollama 当作代码 Agent 是两回事。
 - 晋级需要显式批准。baseline、Candidate 发生变化，Evidence 缺失或 Gate 未解决时，系统会阻止写入原始工作区。
 
 <a id="dev-note"></a>

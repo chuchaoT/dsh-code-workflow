@@ -155,7 +155,7 @@ describe('AutoDev modes and greenfield repositories', () => {
       expect(gated.run.status).toBe('NEEDS_INTERVENTION')
       expect(review?.status).toBe('WARN')
       expect(review?.source).toBe('system')
-      expect(gated.gates.at(-1)?.reason).toContain('static/advisory fallback cannot create Review PASS')
+      expect(gated.gates.at(-1)?.reason).toContain('untrusted model output cannot create Review PASS Evidence')
     } finally {
       runtime.store.close()
     }

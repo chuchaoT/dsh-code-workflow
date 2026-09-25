@@ -50,8 +50,11 @@ export type EvidenceType =
   | 'PLAYBOOK'
   | 'KNOWLEDGE'
 
-/** Jev decision categories used by the Runtime policy. */
-export type DecisionPurpose = 'agent-route' | 'failure-action' | 'quality' | 'completion'
+/** Bounded decision categories used by the Runtime policy. */
+export type DecisionPurpose = 'intent' | 'agent-route' | 'failure-action' | 'quality' | 'completion'
+
+/** Source which produced a validated decision. */
+export type DecisionSource = 'jev' | 'local-model' | 'subagent' | 'static' | 'fallback'
 
 /** Policy for handling Jev availability and confidence. */
 export type JevMode = 'required' | 'advisory' | 'off'
@@ -154,6 +157,8 @@ export interface AutoDevConfig {
   readonly qualityMinScore?: number
   /** Jev endpoint, decision mode, confidence policy, and request limits. */
   readonly jev?: JevConfig
+  /** Optional local-first decision chain; unlike `jev.mode`, this can run while Jev is disabled. */
+  readonly decisions?: DecisionPipelineConfig
   /** Named Provider selection policies available to Runs. */
   readonly routes?: Readonly<Record<string, RoutePolicy>>
   /** Maven executable and argument overrides. */
@@ -197,6 +202,27 @@ export interface JevConfig {
   readonly questionSetVersion?: string
   /** Whether repository paths may be included in Jev context. */
   readonly sendPaths?: boolean
+}
+
+/** Local-first decision chain, configured independently from remote Jev availability. */
+export interface DecisionPipelineConfig {
+  /** Required fails closed to a Human Gate; advisory permits only explicitly untrusted static fallback. */
+  readonly mode?: JevMode
+  /** Optional local Ollama provider. Presence enables it unless `enabled` is false. */
+  readonly ollama?: {
+    readonly enabled?: boolean
+    /** Ollama `/api/chat` endpoint; defaults to the local service. */
+    readonly endpoint?: string
+    /** Installed Ollama model id. Defaults to `qwen3:8b-fast`. */
+    readonly model?: string
+    readonly timeoutMs?: number
+  }
+  /** Optional second-opinion DSH Subagent providers, tried in listed order. */
+  readonly escalationSubagents?: readonly string[]
+  /** Include the remote Jev HTTP adapter after local and Subagent providers. Defaults to false. */
+  readonly useJev?: boolean
+  /** Confidence thresholds shared by the ordered providers; model confidence is self-reported. */
+  readonly minConfidence?: Partial<Record<DecisionPurpose, number>>
 }
 
 /** Maven-specific executable and argument overrides. */
@@ -365,7 +391,7 @@ export interface Evidence {
   readonly nodeId?: string
   /** Execution attempt that produced this Evidence, when applicable. */
   readonly attempt?: number
-  readonly source?: 'runtime' | 'command' | 'agent' | 'human' | 'jev' | 'system'
+  readonly source?: 'runtime' | 'command' | 'agent' | 'human' | 'jev' | 'local-model' | 'subagent' | 'system'
   /** Host-derived actor for an explicit approval; never supplied by a Client. */
   readonly actor?: AutoDevAuditActor
   readonly parentEvidenceIds?: readonly string[]
@@ -755,6 +781,8 @@ export interface RouteDecision {
   readonly eligible: readonly RouteCandidate[]
   readonly selected?: RouteCandidate
   readonly confidence?: number
+  readonly decisionSource?: DecisionSource
+  readonly decisionProviderId?: string
   readonly reason: string
   readonly rejections: readonly { provider: string; reason: string }[]
   readonly createdAt: string
@@ -767,9 +795,11 @@ export interface JevDecision {
   readonly purpose: DecisionPurpose
   readonly stateHash: string
   readonly questionSetVersion: string
-  readonly source: 'jev' | 'static' | 'fallback'
+  readonly source: DecisionSource
   /** Optional stable provider identifier for Jev/local-model extension adapters. */
   readonly providerId?: string
+  /** Host-registered decision purposes for which this provider is trusted. */
+  readonly trustedFor?: readonly DecisionPurpose[]
   readonly modelVersion: string
   readonly answer: readonly DecisionAnswer[]
   readonly probability?: number
@@ -1041,6 +1071,8 @@ export interface DecisionRequest {
   readonly state: unknown
   readonly questions: readonly JevQuestion[]
   readonly signal: AbortSignal
+  /** Ephemeral caller context for DSH Subagent escalation; never sent in the decision state. */
+  readonly parentAgent?: unknown
 }
 
 /** One bounded question and its accepted answer choices. */
@@ -1063,9 +1095,11 @@ export interface DecisionAnswer {
 
 /** Normalized Jev decision result consumed by Host policy. */
 export interface DecisionResult {
-  readonly source: 'jev' | 'static' | 'fallback'
+  readonly source: DecisionSource
   /** Optional provider identity; older providers may omit it. */
   readonly providerId?: string
+  /** Host-owned trust metadata; provider output cannot grant itself trust. */
+  readonly trustedFor?: readonly DecisionPurpose[]
   readonly modelVersion: string
   readonly answers: readonly DecisionAnswer[]
   readonly raw?: unknown
