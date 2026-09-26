@@ -25,6 +25,15 @@ export type RunStatus =
 /** Execution states for one Plan node attempt. */
 export type NodeStatus = 'PENDING' | 'READY' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'UNKNOWN' | 'BLOCKED'
 
+/** Bounded live Agent text/activity snapshot shown in the Run UI, not Evidence. */
+export interface AgentProgressSnapshot {
+  readonly status: 'STREAMING' | 'COMPLETE' | 'PARTIAL'
+  readonly text: string
+  readonly activity?: 'working' | 'tool-started' | 'tool-completed'
+  readonly updatedAt: string
+  readonly truncated?: boolean
+}
+
 /** Verification outcome recorded for an Evidence item. */
 export type EvidenceStatus = 'PASS' | 'FAIL' | 'WARN' | 'UNKNOWN'
 
@@ -127,6 +136,8 @@ export interface RouteCandidate {
 export interface RoutePolicy {
   /** Providers eligible for this route, in preference order. */
   readonly candidates: readonly RouteCandidate[]
+  /** Explicitly selected Provider. When set, selection fails closed instead of falling back. */
+  readonly preferredProvider?: string
   /** Capabilities a task and candidate must both satisfy. */
   readonly requiredTaskTraits?: readonly string[]
   /** Minimum confidence required before Jev can select a candidate. */
@@ -139,6 +150,25 @@ export interface ProviderCatalog {
   readonly routes: Readonly<Record<string, RoutePolicy>>
 }
 
+/** Provider choices persisted for the active DSH Profile; this never contains credentials. */
+export interface AutoDevProviderSettings {
+  readonly decisionBackend: 'ollama' | 'jev' | 'configured'
+  readonly ollamaEndpoint: string
+  readonly ollamaModel: string
+  readonly analysisProvider: string
+  readonly engineeringProvider: string
+}
+
+/** Safe settings view returned to the Web client, including credential presence but not its value. */
+export interface AutoDevProviderSettingsView extends AutoDevProviderSettings {
+  readonly jevApiKeyEnv: string
+  readonly jevCredentialConfigured: boolean
+  readonly providers: readonly ProviderInfo[]
+  readonly analysisProviders: readonly ProviderInfo[]
+  readonly engineeringProviders: readonly ProviderInfo[]
+  readonly activeRunCount: number
+}
+
 /** Bundle settings for storage, execution limits, decisions, and routing. */
 export interface AutoDevConfig {
   /** Root directory for the SQLite database and run artifacts. */
@@ -147,7 +177,9 @@ export interface AutoDevConfig {
   readonly worktreeRoot?: string
   /** Maximum number of explicit implementation attempts for one Run. */
   readonly maxAttempts?: number
-  /** Timeout for Agent and other bounded command operations. */
+  /** Maximum duration of one Agent task before AutoDev requests cancellation (default: 5 minutes). */
+  readonly agentTimeoutMs?: number
+  /** Timeout for shell/CLI command operations. */
   readonly commandTimeoutMs?: number
   /** Timeout applied to Build driver execution. */
   readonly buildTimeoutMs?: number
@@ -163,7 +195,7 @@ export interface AutoDevConfig {
   readonly routes?: Readonly<Record<string, RoutePolicy>>
   /** Maven executable and argument overrides. */
   readonly maven?: MavenConfig
-  /** Select one detected project driver, or fail clearly on ambiguous auto-detection. */
+  /** Select a project driver explicitly (including for a greenfield Worktree), or auto-detect from root markers. */
   readonly buildDriver?: BuildDriverId | 'auto'
   /** Root-project command overrides for Maven, Gradle, Node, and pytest. */
   readonly drivers?: Partial<Record<BuildDriverId, DriverCommandSettings>>
@@ -333,6 +365,8 @@ export interface NodeExecution {
   readonly startedAt?: string
   readonly endedAt?: string
   readonly error?: string
+  /** Provider output for live observability only; never a verification result. */
+  readonly agentProgress?: AgentProgressSnapshot
 }
 
 /** Sealed Worktree result eligible for review and promotion. */
@@ -1054,6 +1088,7 @@ export interface ProviderRunRequest {
   readonly task?: AgentTask
   readonly context?: AutoDevAgentContext
   readonly emitSignal?: (signal: AgentSignalInput) => void
+  readonly onProgress?: (event: import('./protocol.ts').AgentProgressUpdate) => void
 }
 
 /** Normalized completion or failure returned by a Provider adapter. */

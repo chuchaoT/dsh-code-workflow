@@ -33,7 +33,8 @@ export function detectBuildDrivers(root: string): readonly BuildDriverId[] {
   return found
 }
 
-/** Require a unique detected Driver unless the caller explicitly chose one.
+/** Require a unique detected Driver for auto-selection; explicit choices are honored
+ * even for greenfield repositories where the project files will be created in the Worktree.
  * @param root - Repository root whose markers determine the available Drivers.
  * @param requested - Explicit Driver ID, or `auto` to require unambiguous detection.
  * @returns The selected deterministic Build/Test Driver.
@@ -41,9 +42,6 @@ export function detectBuildDrivers(root: string): readonly BuildDriverId[] {
 export function selectBuildDriver(root: string, requested: BuildDriverId | 'auto' | undefined = 'auto'): BuildDriverId {
   const detected = detectBuildDrivers(root)
   if (requested !== undefined && requested !== 'auto') {
-    if (!detected.includes(requested)) {
-      throw new Error(`requested Build/Test driver "${requested}" was not detected at the repository root; detected: ${detected.join(', ') || 'none'}`)
-    }
     return requested
   }
   if (detected.length === 1) return detected[0] as BuildDriverId

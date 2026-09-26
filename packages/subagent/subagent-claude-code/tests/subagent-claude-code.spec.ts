@@ -6,6 +6,7 @@ import type {
   Options,
   Query,
   SDKMessage,
+  SDKPartialAssistantMessage,
   SDKPermissionDeniedMessage,
   SDKResultMessage,
   SpawnOptions,
@@ -24,6 +25,7 @@ import {
 } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { SubagentProgressEvent } from '@deepseek-ai/dsh-subagent'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type {
@@ -84,8 +86,9 @@ const fakeParent = {
 function request(
   prompt: ContentBlock[] = [{ type: 'text', text: 'do the task' }],
   signal = new AbortController().signal,
+  onProgress?: (event: SubagentProgressEvent) => void,
 ) {
-  return { prompt, parent: fakeParent, signal }
+  return { prompt, parent: fakeParent, signal, ...(onProgress === undefined ? {} : { onProgress }) }
 }
 
 async function nextTask(): Promise<void> {
@@ -217,6 +220,7 @@ function expectedFailureDiagnostic(
   stage: 'query-start' | 'query-run' | 'process' | 'teardown',
   category: string,
   outcome?: Partial<SubprocessOutcome>,
+  reason?: string,
 ): string {
   const fields = [
     'product: Claude Code',
@@ -229,7 +233,7 @@ function expectedFailureDiagnostic(
   if (outcome?.signal !== null && outcome?.signal !== undefined) {
     fields.push(`signal: ${outcome.signal}`)
   }
-  return `Product subagent failure (${fields.join('; ')})`
+  return `Product subagent failure (${fields.join('; ')})${reason === undefined ? '' : `; reason: ${reason}`}`
 }
 
 function permissionDenied(): SDKPermissionDeniedMessage {
@@ -246,21 +250,36 @@ function permissionDenied(): SDKPermissionDeniedMessage {
   }
 }
 
+function partialEvent(event: unknown, parentToolUseId: string | null = null): SDKPartialAssistantMessage {
+  return {
+    type: 'stream_event',
+    event,
+    parent_tool_use_id: parentToolUseId,
+    uuid: '00000000-0000-4000-8000-000000000002',
+    session_id: 'session-fixture',
+  } as SDKPartialAssistantMessage
+}
+
 function queryFrom(
   messages: readonly SDKMessage[],
   after?: Error,
   close = vi.fn(),
+  cwd = '/workspace',
+  includeInit = true,
 ): Query {
   async function* stream(): AsyncGenerator<SDKMessage, void> {
+    if (includeInit && !messages.some(message => message.type === 'system' && message.subtype === 'init')) {
+      yield { type: 'system', subtype: 'init', cwd } as SDKMessage
+    }
     for (const message of messages) yield message
     if (after !== undefined) throw after
   }
   return Object.assign(stream(), { close }) as unknown as Query
 }
 
-function waitingQuery(signal: AbortSignal, close = vi.fn()): Query {
+function waitingQuery(signal: AbortSignal, cwd = '/workspace', close = vi.fn()): Query {
   async function* stream(): AsyncGenerator<SDKMessage, void> {
-    yield { type: 'system', subtype: 'init' } as SDKMessage
+    yield { type: 'system', subtype: 'init', cwd } as SDKMessage
     await new Promise<never>((_resolve, reject) => {
       const fail = (): void => {
         reject(signal.reason instanceof Error
@@ -329,7 +348,7 @@ beforeEach(() => {
       env: options.env!,
       signal: options.abortController!.signal,
     }))
-    return queryFrom([{ type: 'system', subtype: 'init' } as SDKMessage])
+    return queryFrom([{ type: 'system', subtype: 'init', cwd: options.cwd! } as SDKMessage])
   })
 })
 
@@ -467,8 +486,8 @@ describe('task admission and package contracts', () => {
         signal: options.abortController!.signal,
       }))
       return options.permissionMode === 'dontAsk'
-        ? waitingQuery(options.abortController!.signal)
-        : queryFrom([success('bypass answer')])
+        ? waitingQuery(options.abortController!.signal, options.cwd!)
+        : queryFrom([success('bypass answer')], undefined, undefined, options.cwd!)
     })
 
     const added: string[] = []
@@ -592,7 +611,7 @@ describe('task admission and package contracts', () => {
       expect(options.permissionMode).toBe(DEFAULT_CLAUDE_CODE_PERMISSION_MODE)
       expect(options.cwd).toBe(process.cwd())
       options.spawnClaudeCodeProcess!(sdkSpawnOptions())
-      return queryFrom([success('native model answer')])
+      return queryFrom([success('native model answer')], undefined, undefined, options.cwd!)
     })
     claudeCode.apply(ctx, { env: {}, disposeGraceMs: 3_000 })
     expect(ctx.subagents.getProvider('claude-code')).toBeDefined()
@@ -695,7 +714,7 @@ describe('task admission and package contracts', () => {
     child.stdout.end()
     await expect(run.result).resolves.toEqual({
       output: [],
-      diagnostic: expectedFailureDiagnostic('query-run', 'invalid-result'),
+      diagnostic: expectedFailureDiagnostic('query-run', 'invalid-result', undefined, 'terminal-result-missing'),
       stopReason: 'error',
     })
     expect(warn).toHaveBeenCalledWith(
@@ -880,6 +899,7 @@ describe('query options and result mapping', () => {
       cwd: '/workspace',
       model: 'claude-explicit-model',
       persistSession: false,
+      includePartialMessages: true,
       disallowedTools: ['AskUserQuestion'],
       permissionMode: 'acceptEdits',
       supportedDialogKinds: ['refusal_fallback_prompt'],
@@ -1040,6 +1060,52 @@ describe('query options and result mapping', () => {
     })
     expect(onPermissionDenied).toHaveBeenCalledOnce()
   })
+
+  it('forwards root text deltas and generic tool activity without arguments or nested output', async () => {
+    const progress: SubagentProgressEvent[] = []
+    await expect(consumeClaudeQuery(queryFrom([
+      partialEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'visible fragment' } }),
+      partialEvent({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'tool-secret', name: 'Bash', input: { command: 'SECRET_COMMAND' } } }),
+      partialEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'nested secret' } }, 'parent-tool'),
+      partialEvent({ type: 'content_block_stop', index: 1 }),
+      success('final answer'),
+    ]), undefined, undefined, '/workspace', event => progress.push(event)))
+      .resolves.toMatchObject({ output: [{ type: 'text', text: 'final answer' }] })
+    expect(progress).toEqual([
+      { type: 'assistant-delta', text: 'visible fragment' },
+      { type: 'activity', activity: 'tool-started' },
+      { type: 'activity', activity: 'tool-completed' },
+    ])
+    expect(JSON.stringify(progress)).not.toContain('SECRET_COMMAND')
+    expect(JSON.stringify(progress)).not.toContain('nested secret')
+  })
+
+  it('requires the SDK init message to confirm the requested Worktree cwd', async () => {
+    const cwd = process.cwd()
+    await expect(consumeClaudeQuery(
+      queryFrom([success('workspace confirmed')], undefined, undefined, cwd),
+      undefined,
+      undefined,
+      cwd,
+    )).resolves.toMatchObject({ stopReason: 'completed' })
+
+    await expect(consumeClaudeQuery(
+      queryFrom([
+        { type: 'system', subtype: 'init', cwd: resolve(cwd, '..') } as SDKMessage,
+        success('must not be accepted'),
+      ], undefined, undefined, cwd),
+      undefined,
+      undefined,
+      cwd,
+    )).rejects.toThrow(expectedFailureDiagnostic('query-run', 'invalid-result'))
+
+    await expect(consumeClaudeQuery(
+      queryFrom([success('missing init')], undefined, undefined, cwd, false),
+      undefined,
+      undefined,
+      cwd,
+    )).rejects.toThrow(expectedFailureDiagnostic('query-run', 'invalid-result'))
+  })
 })
 
 describe('run publication, cancellation, and settlement', () => {
@@ -1066,6 +1132,54 @@ describe('run publication, cancellation, and settlement', () => {
     expect(fixture.child.terminate).toHaveBeenCalledOnce()
   })
 
+  it('returns streamed partial text on cancellation and keeps the stop reason aborted', async () => {
+    const controller = new AbortController()
+    const child = fakeChild()
+    const progress = vi.fn<(event: SubagentProgressEvent) => void>()
+    const received = Promise.withResolvers<undefined>()
+    const streamUpdate = partialEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'partial Claude answer' },
+    })
+    async function* stream(signal: AbortSignal): AsyncGenerator<SDKMessage, void> {
+      yield { type: 'system', subtype: 'init', cwd: '/workspace' } as SDKMessage
+      yield streamUpdate
+      await new Promise<never>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+    }
+    queryMock.mockImplementation(({ options }) => {
+      options.spawnClaudeCodeProcess!(sdkSpawnOptions({
+        cwd: options.cwd!,
+        env: options.env!,
+        signal: options.abortController!.signal,
+      }))
+      return Object.assign(stream(options.abortController!), { close: vi.fn() }) as unknown as Query
+    })
+    const run = await startClaudeCodeRun(
+      request(undefined, controller.signal, (event) => {
+        progress(event)
+        if (event.type === 'assistant-delta') received.resolve()
+      }),
+      {
+        cwd: '/workspace',
+        permissionMode: DEFAULT_CLAUDE_CODE_PERMISSION_MODE,
+        env: {},
+        disposeGraceMs: 5,
+        spawn: () => child.handle,
+      },
+    )
+    await received.promise
+    controller.abort(new Error('cancel after partial output'))
+    await expect(run.result).resolves.toEqual({
+      output: [{ type: 'text', text: 'partial Claude answer' }],
+      stopReason: 'aborted',
+    })
+    expect(progress).toHaveBeenCalledWith({ type: 'assistant-delta', text: 'partial Claude answer' })
+    await run.dispose()
+  })
+
   it('groups SDK errors by parent-action category without changing stop reasons', async () => {
     const cases: Array<readonly [ErrorSubtype, string]> = [
       ['error_during_execution', 'product-error'],
@@ -1082,7 +1196,7 @@ describe('run publication, cancellation, and settlement', () => {
       )
       await expect(run.result).resolves.toEqual({
         output: [],
-        diagnostic: expectedFailureDiagnostic('query-run', category),
+        diagnostic: expectedFailureDiagnostic('query-run', category, undefined, 'sdk-result-not-success'),
         stopReason: 'error',
       })
       expect(onError).toHaveBeenCalledWith(
@@ -1102,7 +1216,7 @@ describe('run publication, cancellation, and settlement', () => {
     const result = await run.result
     expect(result).toEqual({
       output: [],
-      diagnostic: `${expectedFailureDiagnostic('query-run', 'product-error')}\nClaude Code unattended decision (mode: dontAsk; request: tool permission; decision: denied): Claude Code denied the request before an interactive prompt`,
+      diagnostic: `${expectedFailureDiagnostic('query-run', 'product-error', undefined, 'sdk-result-not-success')}\nClaude Code unattended decision (mode: dontAsk; request: tool permission; decision: denied): Claude Code denied the request before an interactive prompt`,
       stopReason: 'error',
     })
     expect(result.diagnostic).not.toContain('SECRET_TOKEN')
@@ -1146,6 +1260,8 @@ describe('run publication, cancellation, and settlement', () => {
       diagnostic: expectedFailureDiagnostic(
         'query-run',
         'product-error',
+        undefined,
+        'sdk-result-not-success',
       ),
       stopReason: 'error',
     })
@@ -1181,16 +1297,16 @@ describe('run publication, cancellation, and settlement', () => {
   })
 
   it('maps invalid success and missing result to fixed query-run facts', async () => {
-    for (const [messages, category] of [
-      [[success('answer', true)], 'invalid-result'],
-      [[success('')], 'invalid-result'],
-      [[{ type: 'system', subtype: 'init' } as SDKMessage], 'invalid-result'],
+    for (const [messages, category, reason] of [
+      [[success('answer', true)], 'invalid-result', 'sdk-result-marked-error'],
+      [[success('')], 'invalid-result', 'sdk-result-empty'],
+      [[{ type: 'system', subtype: 'init' } as SDKMessage], 'invalid-result', 'workspace-mismatch'],
     ] as const) {
       const fixture = fakeRun(messages)
       const run = await startClaudeCodeRun(request(), fixture.spec)
       await expect(run.result).resolves.toEqual({
         output: [],
-        diagnostic: expectedFailureDiagnostic('query-run', category),
+        diagnostic: expectedFailureDiagnostic('query-run', category, undefined, reason),
         stopReason: 'error',
       })
       await run.dispose()
@@ -1206,7 +1322,7 @@ describe('run publication, cancellation, and settlement', () => {
     for (const outcome of outcomes) {
       const child = fakeChild()
       async function* stream(): AsyncGenerator<SDKMessage, void> {
-        yield { type: 'system', subtype: 'init' } as SDKMessage
+        yield { type: 'system', subtype: 'init', cwd: '/workspace' } as SDKMessage
         child.settle(outcome)
         await Promise.resolve()
         throw new Error('SECRET_TOKEN from process transport')
@@ -1621,7 +1737,7 @@ describe('run publication, cancellation, and settlement', () => {
     const close = vi.fn()
     queryMock.mockImplementationOnce(({ options }) => {
       options.spawnClaudeCodeProcess!(sdkSpawnOptions())
-      return queryFrom([], undefined, close)
+      return queryFrom([], undefined, close, '/workspace', false)
     })
 
     const run = await startClaudeCodeRun(request(), {
@@ -1633,7 +1749,7 @@ describe('run publication, cancellation, and settlement', () => {
     })
     await expect(run.result).resolves.toEqual({
       output: [],
-      diagnostic: expectedFailureDiagnostic('query-run', 'invalid-result'),
+      diagnostic: expectedFailureDiagnostic('query-run', 'invalid-result', undefined, 'workspace-not-reported'),
       stopReason: 'error',
     })
     await run.dispose()

@@ -8,6 +8,7 @@ import * as yaml from 'js-yaml'
 import { describe, expect, it, vi } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { SubagentProgressEvent } from '@deepseek-ai/dsh-subagent'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
@@ -82,8 +83,9 @@ const fakeParent = {
 function request(
   prompt: ContentBlock[] = [{ type: 'text', text: 'do the task' }],
   signal = new AbortController().signal,
+  onProgress?: (event: SubagentProgressEvent) => void,
 ) {
-  return { prompt, parent: fakeParent, signal }
+  return { prompt, parent: fakeParent, signal, ...(onProgress === undefined ? {} : { onProgress }) }
 }
 
 async function nextTask(): Promise<void> {
@@ -125,6 +127,10 @@ class ProtocolPeer {
     return this.next(frame => frame.method === method)
   }
 
+  hasMethod(method: string): boolean {
+    return this.frames.some(frame => frame.method === method)
+  }
+
   nextResponse(id: unknown): Promise<JsonObject> {
     return this.next(frame => frame.id === id && frame.method === undefined)
   }
@@ -134,6 +140,21 @@ class ProtocolPeer {
   }
 
   respond(requestFrame: JsonObject, result: unknown): void {
+    // The pinned Codex app-server schema returns the effective cwd on Thread.
+    // Fill it from the request in ordinary fixtures; security-negative tests
+    // use send() directly so omitted or mismatched values remain testable.
+    const response = typeof result === 'object' && result !== null && !Array.isArray(result)
+      ? result as JsonObject
+      : undefined
+    const thread = typeof response?.thread === 'object' && response.thread !== null && !Array.isArray(response.thread)
+      ? response.thread as JsonObject
+      : undefined
+    const params = typeof requestFrame.params === 'object' && requestFrame.params !== null && !Array.isArray(requestFrame.params)
+      ? requestFrame.params as JsonObject
+      : undefined
+    if (requestFrame.method === 'thread/start' && thread !== undefined && thread.cwd === undefined && typeof params?.cwd === 'string') {
+      result = { ...response, thread: { ...thread, cwd: params.cwd } }
+    }
     this.send({ id: requestFrame.id, result })
   }
 }
@@ -626,7 +647,7 @@ describe('task admission and package contracts', () => {
   })
 
   it.each([
-    ['never', { approvalPolicy: 'never' }],
+    ['never', { approvalPolicy: 'never', sandbox: 'workspace-write' }],
     ['approve-for-me', {
       approvalPolicy: 'on-request',
       approvalsReviewer: 'auto_review',
@@ -683,6 +704,7 @@ describe('task admission and package contracts', () => {
       ephemeral: true,
       model: 'codex-explicit-model',
       approvalPolicy: 'never',
+      sandbox: 'workspace-write',
     })
     child.peer.respond(threadStart, { thread: { id: 'thread-1', ephemeral: true } })
     await starting
@@ -746,6 +768,32 @@ describe('task admission and package contracts', () => {
 })
 
 describe('CodexAppServerWire', () => {
+  it.each([
+    ['missing', undefined],
+    ['mismatched', resolve(process.cwd(), '..')],
+  ] as const)('rejects a %s effective thread cwd before publishing the Agent run', async (_label, returnedCwd) => {
+    const child = fakeChild()
+    const starting = startCodexRun(request(), runSpec(child, { cwd: process.cwd() }))
+    const initialize = await child.peer.nextMethod('initialize')
+    child.peer.respond(initialize, { userAgent: 'codex-cli 0.153.4' })
+    await child.peer.nextMethod('initialized')
+    const threadStart = await child.peer.nextMethod('thread/start')
+    child.peer.send({
+      id: threadStart.id,
+      result: {
+        thread: {
+          id: 'thread-unexpected-cwd',
+          ephemeral: true,
+          ...(returnedCwd === undefined ? {} : { cwd: returnedCwd }),
+        },
+      },
+    })
+
+    await expect(starting).rejects.toThrow(expectedFailureDiagnostic('thread-start', 'unknown'))
+    await nextTask()
+    expect(child.peer.hasMethod('turn/start')).toBe(false)
+  })
+
   it('sends the fixed handshake, thread, and turn payloads and keeps final_answer', async () => {
     const child = fakeChild()
     const wire = defaultWire(child)
@@ -775,6 +823,7 @@ describe('CodexAppServerWire', () => {
       cwd: '/workspace',
       ephemeral: true,
       approvalPolicy: 'never',
+      sandbox: 'workspace-write',
     })
     child.peer.respond(threadStart, { thread: { id: 'thread-1', ephemeral: true } })
     await starting
@@ -837,6 +886,52 @@ describe('CodexAppServerWire', () => {
       output: [{ type: 'text', text: 'fallback' }],
       stopReason: 'completed',
     })
+    wire.close()
+  })
+
+  it('streams only user-facing answer deltas and generic tool activity', async () => {
+    const child = fakeChild()
+    const progress: SubagentProgressEvent[] = []
+    const wire = new CodexAppServerWire(
+      child.handle.stdout!,
+      child.handle.stdin!,
+      DEFAULT_CODEX_PERMISSION_MODE,
+      undefined,
+      event => progress.push(event),
+    )
+    wire.start()
+    const initializing = wire.initialize(new AbortController().signal)
+    const initialize = await child.peer.nextMethod('initialize')
+    child.peer.respond(initialize, { userAgent: 'codex-cli 0.153.4' })
+    await initializing
+    await child.peer.nextMethod('initialized')
+    const threadStarting = wire.startThread(process.cwd(), new AbortController().signal)
+    const threadStart = await child.peer.nextMethod('thread/start')
+    child.peer.respond(threadStart, { thread: { id: 'thread-1', ephemeral: true } })
+    await threadStarting
+    const running = wire.runTurn(['task'], new AbortController().signal)
+    const turnStart = await child.peer.nextMethod('turn/start')
+    child.peer.respond(turnStart, { turn: { id: 'turn-1' } })
+    child.peer.send(
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1' } } },
+      { method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'commentary-1', type: 'agentMessage', phase: 'commentary' } } },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'commentary-1', delta: 'private commentary' } },
+      { method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'tool-1', type: 'commandExecution', command: 'must not escape' } } },
+      { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'tool-1', type: 'commandExecution', command: 'must not escape' } } },
+      { method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'answer-1', type: 'agentMessage', phase: 'final_answer' } } },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'answer-1', delta: 'answer fragment' } },
+      agentMessage('complete answer', 'final_answer'),
+      turnCompleted('completed'),
+    )
+    await expect(running).resolves.toMatchObject({ stopReason: 'completed' })
+    expect(progress).toEqual([
+      { type: 'activity', activity: 'working' },
+      { type: 'activity', activity: 'tool-started' },
+      { type: 'activity', activity: 'tool-completed' },
+      { type: 'assistant-delta', text: 'answer fragment' },
+    ])
+    expect(JSON.stringify(progress)).not.toContain('must not escape')
+    expect(JSON.stringify(progress)).not.toContain('private commentary')
     wire.close()
   })
 
@@ -1567,6 +1662,36 @@ describe('run lifecycle and quiescence', () => {
     await run.dispose()
   })
 
+  it('returns streamed answer text on cancellation without claiming completion', async () => {
+    const controller = new AbortController()
+    const progress = vi.fn()
+    const child = fakeChild()
+    const starting = startCodexRun(
+      request(undefined, controller.signal, progress),
+      runSpec(child),
+    )
+    const initialize = await child.peer.nextMethod('initialize')
+    child.peer.respond(initialize, { userAgent: 'codex-cli 0.153.4' })
+    await child.peer.nextMethod('initialized')
+    const threadStart = await child.peer.nextMethod('thread/start')
+    child.peer.respond(threadStart, { thread: { id: 'thread-1', ephemeral: true } })
+    const run = await starting
+    const turnStart = await child.peer.nextMethod('turn/start')
+    child.peer.respond(turnStart, { turn: { id: 'turn-1' } })
+    child.peer.send(
+      { method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'answer-1', type: 'agentMessage', phase: 'final_answer' } } },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'answer-1', delta: 'partial answer' } },
+    )
+    await nextTask()
+    controller.abort(new Error('stop'))
+    await expect(run.result).resolves.toEqual({
+      output: [{ type: 'text', text: 'partial answer' }],
+      stopReason: 'aborted',
+    })
+    expect(progress).toHaveBeenCalledWith({ type: 'assistant-delta', text: 'partial answer' })
+    await run.dispose()
+  })
+
   it('reports turn-start failures and omits captured facts after success', async () => {
     {
       const { child, run, turnStart } = await publishRun()
@@ -2051,6 +2176,7 @@ describe('run lifecycle and quiescence', () => {
       cwd: process.cwd(),
       ephemeral: true,
       approvalPolicy: 'never',
+      sandbox: 'workspace-write',
     })
     child.peer.respond(threadStart, { thread: { id: 'thread-1', ephemeral: true } })
     controller.abort('startup race')

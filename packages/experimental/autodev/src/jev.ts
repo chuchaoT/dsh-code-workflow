@@ -132,11 +132,12 @@ export class DecisionCoordinator {
   readonly config: Required<Pick<JevConfig, 'mode' | 'questionSetVersion'>> & JevConfig
   private readonly providers: {
     readonly id: string
-    readonly provider: DecisionProvider
+    provider: DecisionProvider
     readonly priority: number
     readonly trustedFor: readonly DecisionPurpose[]
   }[]
   private readonly staticProvider: DecisionProvider
+  private activeProviderId: string | undefined
 
   constructor(options: DecisionCoordinatorOptions = {}) {
     const config = options.config ?? {}
@@ -175,6 +176,36 @@ export class DecisionCoordinator {
     }
   }
 
+  /** Return whether a named decision backend is registered.
+   * @param id Stable provider identifier.
+   */
+  hasProvider(id: string): boolean {
+    return this.providers.some(item => item.id === id)
+  }
+
+  /** Replace an already registered adapter without changing its trusted-purpose boundary.
+   * @param id Stable provider identifier.
+   * @param provider New adapter instance.
+   */
+  replaceProvider(id: string, provider: DecisionProvider): void {
+    const registration = this.providers.find(item => item.id === id)
+    if (registration === undefined) throw new Error(`decision provider "${id}" is not registered`)
+    registration.provider = provider
+  }
+
+  /** Pin decision evaluation to one backend; failures do not fall through to another remote provider.
+   * @param id Registered provider id, or undefined to restore ordered provider selection.
+   */
+  setActiveProvider(id: string | undefined): void {
+    if (id !== undefined && !this.hasProvider(id)) throw new Error(`decision provider "${id}" is not registered`)
+    this.activeProviderId = id
+  }
+
+  /** The explicitly pinned backend, when one is selected. */
+  get activeProvider(): string | undefined {
+    return this.activeProviderId
+  }
+
   /** Evaluate a bounded decision request and apply required/advisory/off policy.
    * @param purpose - Decision category whose confidence policy applies.
    * @param state - Structured state supplied to Jev after path sanitization.
@@ -199,6 +230,7 @@ export class DecisionCoordinator {
     }
     const failures: string[] = []
     for (const registration of this.providers) {
+      if (this.activeProviderId !== undefined && registration.id !== this.activeProviderId) continue
       try {
         const result = await registration.provider.evaluate({
           purpose, state: sanitizedState, questions, signal,

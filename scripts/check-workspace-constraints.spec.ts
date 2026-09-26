@@ -250,6 +250,32 @@ describe('package payload constraints', () => {
     const manifest = JSON.parse(readFileSync(new URL(`../${dir}/package.json`, import.meta.url), 'utf8')) as WorkspaceManifest['manifest']
     expect(checkWorkspaceManifest({ dir, manifest })).toEqual([])
   })
+
+  it('publishes AutoDev contract and router subpath bundles without a broad lib glob', () => {
+    const dir = 'packages/experimental/autodev'
+    const manifest = JSON.parse(readFileSync(new URL(`../${dir}/package.json`, import.meta.url), 'utf8')) as WorkspaceManifest['manifest']
+    expect(expectedDshPackageFiles(manifest)).toEqual([
+      'lib/index.js',
+      'lib/client.js',
+      'cordis.patch.yml',
+      'lib/contracts.js',
+      'lib/router.js',
+      'lib/router-*.js',
+      'lib/types/**/*.d.ts',
+      'lib/typert.host.js',
+      'lib/typert.host.d.ts',
+      'lib/typert.remote-client.js',
+      'lib/typert.remote-client.d.ts',
+    ])
+    expect(checkWorkspaceManifest({ dir, manifest })).toEqual([])
+
+    for (const omitted of ['lib/contracts.js', 'lib/router.js', 'lib/router-*.js']) {
+      expect(checkWorkspaceManifest({
+        dir,
+        manifest: { ...manifest, files: manifest.files!.filter(file => file !== omitted) },
+      })).toEqual([expect.stringContaining('package.json files must be')])
+    }
+  })
 })
 
 it('publishes CLI runtime declarations and rejects a payload that omits them', () => {

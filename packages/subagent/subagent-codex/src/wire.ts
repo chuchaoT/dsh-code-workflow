@@ -8,8 +8,10 @@
  */
 
 import type { Readable, Writable } from 'node:stream'
+import { realpathSync } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { SubagentResult } from '@deepseek-ai/dsh-subagent'
+import type { SubagentProgressEvent, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import { JsonRpcLineTransport } from '@deepseek-ai/dsh-sdk-protocol'
 import type { CodexPermissionMode } from './run.ts'
 
@@ -30,7 +32,9 @@ export interface CodexWireFailureFacts {
 }
 
 const THREAD_PERMISSION_PARAMS: Readonly<Record<CodexPermissionMode, JsonObject>> = {
-  never: { approvalPolicy: 'never' },
+  // Non-interactive execution must still confine edits to the requested
+  // per-run Worktree instead of inheriting a broader user-level sandbox.
+  never: { approvalPolicy: 'never', sandbox: 'workspace-write' },
   'approve-for-me': {
     approvalPolicy: 'on-request',
     approvalsReviewer: 'auto_review',
@@ -54,6 +58,26 @@ function string(value: unknown, label: string): string {
     throw new Error(`subagent-codex: app-server returned invalid ${label}`)
   }
   return value
+}
+
+function matchesWorkspacePath(requested: string, actual: string): boolean {
+  if (!isAbsolute(actual)) return false
+  const requestedPath = resolve(requested)
+  const actualPath = resolve(actual)
+  const normalize = (value: string): string => process.platform === 'win32' ? value.toLowerCase() : value
+  let expectedCanonical: string
+  try {
+    expectedCanonical = realpathSync(requestedPath)
+  } catch {
+    // The runtime's managed Worktree always exists. The normalized fallback
+    // keeps this adapter testable with non-existent but identical fixture paths.
+    return normalize(requestedPath) === normalize(actualPath)
+  }
+  try {
+    return normalize(expectedCanonical) === normalize(realpathSync(actualPath))
+  } catch {
+    return false
+  }
 }
 
 function unattendedDecision(params: JsonObject): 'cancel' | 'decline' {
@@ -206,6 +230,8 @@ export class CodexAppServerWire {
   }> = []
   private lastFinalAnswer: string | undefined
   private lastUnphasedAnswer: string | undefined
+  private partialFinalAnswer = ''
+  private readonly assistantPhases = new Map<string, unknown>()
   private diagnostic: string | undefined
   private failure: CodexWireFailureFacts | undefined
   private diagnosticOrder = 0
@@ -225,6 +251,7 @@ export class CodexAppServerWire {
     output: Writable,
     private readonly permissionMode: CodexPermissionMode,
     private readonly model?: string,
+    private readonly onProgress?: (event: SubagentProgressEvent) => void,
   ) {
     this.transport = new JsonRpcLineTransport(input, output)
     // Fatal protocol state can arrive after the current guarded operation has
@@ -296,6 +323,10 @@ export class CodexAppServerWire {
     const id = string(thread.id, 'thread/start thread id')
     if (thread.ephemeral !== true) {
       throw new Error('subagent-codex: app-server did not create an ephemeral thread')
+    }
+    const actualCwd = string(thread.cwd, 'thread/start thread cwd')
+    if (!matchesWorkspacePath(cwd, actualCwd)) {
+      throw new Error('subagent-codex: app-server thread cwd does not match the requested workspace')
     }
     this.threadId = id
   }
@@ -390,7 +421,7 @@ export class CodexAppServerWire {
    * @returns the selected final or nullable-phase text block, if any.
    */
   collectOutput(): ContentBlock[] {
-    const selected = this.lastFinalAnswer ?? this.lastUnphasedAnswer
+    const selected = this.lastFinalAnswer ?? this.lastUnphasedAnswer ?? this.partialFinalAnswer
     return selected !== undefined && selected.trim().length > 0
       ? [{ type: 'text', text: selected }]
       : []
@@ -641,12 +672,16 @@ export class CodexAppServerWire {
       if (this.turnCompleted !== undefined && this.turnId === undefined) {
         this.observePendingTurnId(string(turn.id, 'turn/started turn id'))
       }
+      if (this.turnCompleted !== undefined
+        && (this.turnId === undefined || turn.id === this.turnId)) {
+        this.emitProgress({ type: 'activity', activity: 'working' })
+      }
       return
     }
-    if (method === 'item/completed') {
-      const threadId = string(params.threadId, 'item/completed thread id')
+    if (method === 'item/started' || method === 'item/completed' || method === 'item/agentMessage/delta') {
+      const threadId = string(params.threadId, `${method} thread id`)
       if (threadId !== this.threadId) return
-      const id = string(params.turnId, 'item/completed turn id')
+      const id = string(params.turnId, `${method} turn id`)
       if (this.turnId === undefined) {
         if (this.turnCompleted !== undefined) {
           this.observePendingTurnId(id)
@@ -659,9 +694,33 @@ export class CodexAppServerWire {
         return
       }
       if (id !== this.turnId) return
-      const item = object(params.item, 'item/completed item')
+      if (method === 'item/agentMessage/delta') {
+        const itemId = string(params.itemId, 'item/agentMessage/delta item id')
+        const delta = string(params.delta, 'item/agentMessage/delta text')
+        const phase = this.assistantPhases.get(itemId)
+        // Never stream commentary/reasoning. Only final answer messages and
+        // nullable-phase assistant answers are user-facing output.
+        if (phase === 'final_answer' || phase === null) {
+          this.partialFinalAnswer += delta
+          this.emitProgress({ type: 'assistant-delta', text: delta })
+        }
+        return
+      }
+      const item = object(params.item, `${method} item`)
+      if (method === 'item/started') {
+        if (item.type === 'agentMessage') {
+          if (typeof item.id === 'string') this.assistantPhases.set(item.id, item.phase)
+        } else if (item.type !== 'reasoning') {
+          this.emitProgress({ type: 'activity', activity: 'tool-started' })
+        }
+        return
+      }
+      if (item.type !== 'agentMessage' && item.type !== 'reasoning') {
+        this.emitProgress({ type: 'activity', activity: 'tool-completed' })
+      }
       if (this.recordDeclinedItem(item, order)) return
       if (item.type !== 'agentMessage') return
+      if (typeof item.id === 'string') this.assistantPhases.delete(item.id)
       const text = typeof item.text === 'string'
         ? item.text
         : (() => { throw new Error('subagent-codex: app-server returned an invalid agent message') })()
@@ -699,5 +758,13 @@ export class CodexAppServerWire {
       params,
       order: order ?? this.nextObservationOrder(),
     })
+  }
+
+  private emitProgress(event: SubagentProgressEvent): void {
+    try {
+      this.onProgress?.(event)
+    } catch {
+      // Progress is best-effort and cannot become a provider/run failure.
+    }
   }
 }

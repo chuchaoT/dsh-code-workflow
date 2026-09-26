@@ -59,6 +59,7 @@ import type {
   SubagentCapabilities,
   SubagentInterruptAuthority,
   SubagentProvider,
+  SubagentProgressEvent,
   SubagentRun,
   SubagentRunEndInfo,
   SubagentRunInfo,
@@ -93,6 +94,7 @@ export type {
   SubagentCapabilities,
   SubagentInterruptAuthority,
   SubagentProvider,
+  SubagentProgressEvent,
   SubagentResult,
   SubagentRun,
   SubagentSendMessageOptions,
@@ -566,7 +568,21 @@ export class SubagentRuntime extends TypertRemoteService {
       provider: name,
       ...request.label !== undefined ? { label: request.label } : {},
     })
-    const resolved: ResolvedSubagentStartRequest = { ...request, descriptor }
+    const resolved: ResolvedSubagentStartRequest = {
+      ...request,
+      ...(request.onProgress === undefined ? {} : {
+        // Progress is observational only. A consumer's UI/store callback must
+        // never be able to fail provider startup or the actual agent run.
+        onProgress: (event: SubagentProgressEvent) => {
+          try {
+            request.onProgress?.(event)
+          } catch (error: unknown) {
+            this.ctx.logger.warn(`subagent: progress observer failed: ${String(error)}`)
+          }
+        },
+      }),
+      descriptor,
+    }
     const run = await provider.start(resolved)
     const child = run.localAgent?.session
     if (child !== undefined) {
@@ -649,6 +665,7 @@ export class SubagentRuntime extends TypertRemoteService {
       { when: request.toolFilter !== undefined, cap: 'toolFilter' },
       { when: request.persona !== undefined, cap: 'persona' },
       { when: request.workspaceCwd !== undefined, cap: 'workspaceCwd' },
+      { when: request.onProgress !== undefined, cap: 'progress' },
     ]
     for (const { when, cap } of needs) {
       if (when && provider.capabilities[cap] !== true) {

@@ -9,6 +9,14 @@ import type { RepositoryBaseline } from './contracts.ts'
 /** Reconciled outcome of applying a sealed Candidate patch. */
 export type GitPromotionOutcome = 'applied' | 'already-applied'
 
+/** Read-only repository state used to verify that an Agent stayed in its Worktree. */
+export interface GitWorkingState {
+  readonly head?: string
+  readonly symbolicHead?: string
+  readonly status: string
+  readonly statusIncludingIgnored: string
+}
+
 /** Promotion failure with an explicit statement about whether writes may have occurred. */
 export class GitPromotionError extends Error {
   constructor(
@@ -134,6 +142,61 @@ export class GitManager {
     const result = await this.commands.run(['git', 'status', '--porcelain=v1'], worktreePath, { signal })
     if (result.exitCode !== 0) throw new Error(`git status failed: ${result.stderr.trim()}`)
     return result.stdout.split(/\r?\n/).filter(Boolean)
+  }
+
+  /** Capture the target checkout without staging or otherwise modifying it.
+   * @param repoRoot - Canonical repository root.
+   * @param signal - Optional cancellation signal for Git.
+   * @returns HEAD, branch, and porcelain snapshots, including ignored paths for delta checks.
+   */
+  async captureWorkingState(repoRoot: string, signal?: AbortSignal): Promise<GitWorkingState> {
+    const [head, symbolicHead, status, statusIncludingIgnored] = await Promise.all([
+      this.commands.run(['git', 'rev-parse', '--verify', 'HEAD'], repoRoot, { signal }),
+      this.commands.run(['git', 'symbolic-ref', '--quiet', 'HEAD'], repoRoot, { signal }),
+      this.commands.run(['git', 'status', '--porcelain=v1', '--untracked-files=all'], repoRoot, { signal }),
+      this.commands.run(['git', 'status', '--porcelain=v1', '--untracked-files=all', '--ignored'], repoRoot, { signal }),
+    ])
+    if (status.exitCode !== 0 || statusIncludingIgnored.exitCode !== 0) {
+      throw new Error(`cannot inspect repository working state: ${status.stderr.trim() || statusIncludingIgnored.stderr.trim()}`)
+    }
+    if (head.exitCode !== 0 && symbolicHead.exitCode !== 0) {
+      throw new Error(`cannot inspect repository HEAD: ${head.stderr.trim() || symbolicHead.stderr.trim()}`)
+    }
+    return {
+      ...(head.exitCode === 0 ? { head: head.stdout.trim() } : {}),
+      ...(symbolicHead.exitCode === 0 ? { symbolicHead: symbolicHead.stdout.trim() } : {}),
+      status: status.stdout,
+      statusIncludingIgnored: statusIncludingIgnored.stdout,
+    }
+  }
+
+  /** Explain whether a captured checkout still matches its clean Run baseline.
+   * @param state - Read-only state captured from the original checkout.
+   * @param baseCommit - Commit or synthetic baseline captured by AutoDev.
+   * @param baselineKind - Whether the source checkout began committed or unborn.
+   * @returns A concise drift reason, or undefined when the baseline is intact.
+   */
+  baselineDrift(state: GitWorkingState, baseCommit: string, baselineKind: 'commit' | 'unborn' = 'commit'): string | undefined {
+    if (state.status.trim() !== '') return 'original repository has tracked or untracked changes'
+    if (baselineKind === 'unborn') {
+      if (state.head !== undefined) return 'original repository gained a commit after its unborn baseline'
+      if (state.symbolicHead === undefined) return 'original repository no longer has its unborn branch'
+      return undefined
+    }
+    if (state.head !== baseCommit) return 'original repository HEAD changed after the Run baseline'
+    return undefined
+  }
+
+  /** Compare two read-only checkout snapshots, including ignored files.
+   * @param before - State captured before external Agent execution.
+   * @param after - State captured after external Agent execution.
+   * @returns True only when all observed checkout state is unchanged.
+   */
+  sameWorkingState(before: GitWorkingState, after: GitWorkingState): boolean {
+    return before.head === after.head
+      && before.symbolicHead === after.symbolicHead
+      && before.status === after.status
+      && before.statusIncludingIgnored === after.statusIncludingIgnored
   }
 
   /** Produce a binary-safe patch from a base commit to the Candidate Worktree.

@@ -17,6 +17,12 @@ export const MAX_AGENT_CONTEXT_CHARS = 6000
 /** Task categories understood by the normalized Agent Protocol. */
 export type AgentTaskKind = 'implement' | 'review' | 'analyze' | 'verify' | 'custom'
 
+/** Non-authoritative provider progress; never counts as Evidence or verification. */
+export type AgentProgressUpdate =
+  | { readonly type: 'assistant-delta'; readonly text: string }
+  | { readonly type: 'activity'; readonly activity: 'working' | 'tool-started' | 'tool-completed' }
+  | { readonly type: 'assistant-reset' }
+
 /** One bounded unit of Agent work tied to a Run, Plan version, Node, and Attempt. */
 export interface AgentTask {
   readonly protocolVersion: typeof AGENT_PROTOCOL_VERSION
@@ -183,6 +189,8 @@ export interface AgentAdapterRequest {
   readonly context: AutoDevAgentContext
   readonly signal: AbortSignal
   readonly parentAgent?: unknown
+  /** Bounded, non-authoritative stream updates for the live Run UI. */
+  readonly onProgress?: (event: AgentProgressUpdate) => void
   readonly emitSignal: (signal: AgentSignalInput) => void
 }
 
@@ -264,6 +272,15 @@ export class AgentProtocol {
     const emitted: AgentSignalInput[] = []
     const result = await adapter.execute({
       ...request,
+      ...(request.onProgress === undefined ? {} : {
+        onProgress: (event: AgentProgressUpdate) => {
+          try {
+            request.onProgress?.(event)
+          } catch {
+            // A progress display/store observer cannot fail the Agent task.
+          }
+        },
+      }),
       emitSignal: (signal) => { if (emitted.length < MAX_AGENT_SIGNALS) emitted.push(signal) },
     })
     const normalizedResult = normalizeResult(adapter.name, result)

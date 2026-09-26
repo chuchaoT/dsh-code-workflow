@@ -65,8 +65,54 @@
   font-size: 0.96em;
 }
 
+.tabList {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 4px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12));
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-base, Canvas);
+}
+
+.tabButton {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  border-color: transparent !important;
+  color: var(--dsw-alias-label-secondary, #555b64) !important;
+  background: transparent !important;
+}
+
+.tabButton[aria-selected='true'] {
+  border-color: var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12)) !important;
+  color: var(--dsw-alias-label-primary, #1f2328) !important;
+  background: var(--dsw-alias-bg-layer-1, Canvas) !important;
+  box-shadow: 0 1px 3px rgba(15, 17, 21, 0.08);
+}
+
+.tabPanel {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.tabPanel [hidden] {
+  display: none !important;
+}
+
+.tabPanelBlock {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
 .card,
-.root > [data-autodev-section] {
+.tabPanel [data-autodev-section] {
   border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12));
   border-radius: 12px;
   background: var(--dsw-alias-bg-layer-1, Canvas);
@@ -78,6 +124,61 @@
   gap: 18px;
   padding: 20px;
   border-top: 3px solid var(--dsw-alias-state-business-primary, #4176e6);
+}
+
+.providerSettings {
+  display: grid;
+  gap: 14px;
+  padding: 18px 20px;
+}
+
+.runHistory {
+  display: grid;
+  gap: 14px;
+  padding: 18px 20px;
+}
+
+.runCount {
+  display: inline-flex;
+  min-width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 7px;
+  border-radius: 999px;
+  color: var(--dsw-alias-label-secondary, #555b64);
+  background: var(--dsw-alias-bg-module-platform, #f3f5f8);
+  font-size: 0.84em;
+  font-variant-numeric: tabular-nums;
+}
+
+.providerNotice,
+.providerHelp,
+.providerWarning {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary, #707784);
+  font-size: 0.93em;
+}
+
+.providerWarning {
+  color: var(--dsw-alias-state-warning-primary, #9b5c06);
+}
+
+.providerWarning code,
+.providerHelp code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: var(--dsw-alias-bg-module-platform, #f3f5f8);
+  font-family: var(--dsh-font-family-mono, ui-monospace, monospace);
+}
+
+.providerStatus {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12));
+  border-radius: 999px;
+  color: var(--dsw-alias-label-tertiary, #707784);
+  font-size: 0.82em;
 }
 
 .cardHeading {
@@ -331,7 +432,7 @@
   background: var(--dsw-alias-state-warn-tertiary, #fef5e7);
 }
 
-.root > [data-autodev-section='backup'] {
+.tabPanel [data-autodev-section='backup'] {
   display: grid;
   gap: 14px;
   padding: 18px;
@@ -374,14 +475,14 @@
   background: var(--dsw-alias-bg-module-platform, #f6f7f8);
 }
 
-.root > [data-autodev-section='retention'] {
+.tabPanel [data-autodev-section='retention'] {
   display: grid;
   gap: 12px;
   padding: 18px;
   border-color: var(--dsw-alias-state-warn-secondary, #f7ad31);
 }
 
-.root > [data-autodev-section='retention'] > strong {
+.tabPanel [data-autodev-section='retention'] > strong {
   color: var(--dsw-alias-label-primary, #1f2328);
   font-size: 1.08em;
   font-weight: 620;
@@ -411,6 +512,36 @@
   border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12)) !important;
   border-radius: 10px !important;
   background: var(--dsw-alias-bg-layer-1, Canvas) !important;
+}
+
+.agentProgress {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 8px 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12));
+  border-left: 3px solid var(--dsw-alias-state-business-primary, #4176e6);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-module-platform, #f6f7f8);
+}
+
+.agentProgressHeader {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 10px;
+  color: var(--dsw-alias-label-secondary, #555b64);
+  font-size: 0.9em;
+}
+
+.agentProgressText {
+  max-height: 220px;
+  margin: 0 !important;
+  padding: 8px 10px !important;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.9em !important;
 }
 
 .root article:not(.detailCard) {
@@ -500,8 +631,8 @@
     grid-column: auto;
   }
 
-  .root > [data-autodev-section='backup'],
-  .root > [data-autodev-section='retention'],
+  .tabPanel [data-autodev-section='backup'],
+  .tabPanel [data-autodev-section='retention'],
   .detailCard {
     padding: 14px !important;
   }

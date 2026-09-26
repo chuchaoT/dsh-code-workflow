@@ -34,6 +34,7 @@ import type {
   SemanticUncertainty,
   SideEffectRecord,
   NodeExecution,
+  AgentProgressSnapshot,
   PlanVersion,
   RouteDecision,
   Run,
@@ -50,7 +51,7 @@ type RecordKind =
   | 'verification-check' | 'verification-result' | 'verification'
   | 'memory' | 'assumption' | 'uncertainty' | 'concept' | 'concept-observation'
   | 'playbook' | 'playbook-fit' | 'knowledge' | 'knowledge-merge' | 'compaction' | 'regression-case' | 'regression-result' | 'regression-suite'
-  | 'action-intent' | 'side-effect' | 'cleanup-job'
+  | 'action-intent' | 'side-effect' | 'cleanup-job' | 'setting'
 
 /** Resolve the stable default AutoDev data directory below DSH_HOME or the user home.
  * @returns Absolute AutoDev data directory.
@@ -114,6 +115,22 @@ export class AutoDevStore {
   /** Close the SQLite connection and release its file handle. */
   close(): void {
     this.db.close()
+  }
+
+  /** Read one profile-scoped AutoDev setting from the existing durable record store.
+   * @param key Stable setting identifier.
+   * @returns The decoded setting, when present.
+   */
+  getSetting<T>(key: string): T | undefined {
+    return this.get<T>('setting', requireSettingKey(key))
+  }
+
+  /** Persist a profile-scoped AutoDev setting without requiring a schema migration.
+   * @param key Stable setting identifier.
+   * @param value JSON-safe setting value; credentials must never be stored here.
+   */
+  setSetting<T>(key: string, value: T): void {
+    this.put('setting', requireSettingKey(key), '', value)
   }
 
   /** Create a transactionally consistent SQLite snapshot at a new file path.
@@ -268,6 +285,23 @@ export class AutoDevStore {
   saveNode(node: NodeExecution): void {
     this.put('node', node.id, node.runId, node)
     this.event(node.runId, 'node/updated', node)
+  }
+
+  /** Update only the live progress projection; token updates are not audit events. */
+  saveNodeProgress(
+    id: string,
+    expected: Pick<NodeExecution, 'runId' | 'planId' | 'nodeId' | 'attempt'>,
+    agentProgress: AgentProgressSnapshot,
+  ): boolean {
+    const current = this.getNode(id)
+    if (current === undefined
+      || current.status !== 'RUNNING'
+      || current.runId !== expected.runId
+      || current.planId !== expected.planId
+      || current.nodeId !== expected.nodeId
+      || current.attempt !== expected.attempt) return false
+    this.put('node', id, current.runId, { ...current, agentProgress })
+    return true
   }
 
   /** Read a node execution by identifier.
@@ -1579,4 +1613,10 @@ function normalizeLegacySourceRefs(value: unknown): unknown {
 
 function projectKeyOf(scope: ScopeQuery | undefined): string | undefined {
   return scope === undefined ? undefined : typeof scope === 'string' ? scope.trim() : normalizeScope(scope).projectKey
+}
+
+function requireSettingKey(value: string): string {
+  const key = value.trim()
+  if (key.length === 0 || key.length > 128) throw new TypeError('AutoDev setting key must be non-empty and bounded')
+  return key
 }

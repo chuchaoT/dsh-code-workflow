@@ -44,6 +44,7 @@ describe('AutoDev Runtime dynamic route registration', () => {
 
     try {
       const dispose = runtime.registerRoutedProvider('implement', provider)
+      runtime.router.setPreferredProvider('implement', 'local-code-agent')
       const signal = new AbortController().signal
       const selection = await runtime.router.select(
         undefined,

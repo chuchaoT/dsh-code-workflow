@@ -1,8 +1,21 @@
 /** Safe argv-based command execution through Harness's subprocess seam. */
 
 import { spawn as nodeSpawn } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 import type { Readable } from 'node:stream'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+
+/** Output channel exposed by a bounded command execution. */
+export type CommandOutputStream = 'stdout' | 'stderr'
+
+/** Optional bounds and live-output observer for one command invocation. */
+export interface CommandRunOptions {
+  readonly signal?: AbortSignal | undefined
+  readonly timeoutMs?: number
+  readonly env?: Readonly<Record<string, string | undefined>>
+  readonly maxOutputBytes?: number
+  readonly onOutput?: ((stream: CommandOutputStream, text: string) => void) | undefined
+}
 
 /** Bounded result captured from one argv-based command execution. */
 export interface CommandResult {
@@ -18,24 +31,14 @@ export interface CommandResult {
 
 /** Execution seam used by Git, Drivers, and Provider adapters. */
 export interface CommandExecutor {
-  run(argv: readonly string[], cwd: string, options?: {
-    readonly signal?: AbortSignal | undefined
-    readonly timeoutMs?: number
-    readonly env?: Readonly<Record<string, string | undefined>>
-    readonly maxOutputBytes?: number
-  }): Promise<CommandResult>
+  run(argv: readonly string[], cwd: string, options?: CommandRunOptions): Promise<CommandResult>
 }
 
 /** Uses the Harness process-range owner when one is available. */
 export class HarnessCommandExecutor implements CommandExecutor {
   constructor(private readonly subprocess?: SubprocessRuntime) {}
 
-  async run(argv: readonly string[], cwd: string, options: {
-    readonly signal?: AbortSignal | undefined
-    readonly timeoutMs?: number
-    readonly env?: Readonly<Record<string, string | undefined>>
-    readonly maxOutputBytes?: number
-  } = {}): Promise<CommandResult> {
+  async run(argv: readonly string[], cwd: string, options: CommandRunOptions = {}): Promise<CommandResult> {
     if (argv.length === 0 || argv[0] === undefined || argv[0].length === 0) {
       throw new TypeError('command argv must contain a non-empty executable')
     }
@@ -53,12 +56,7 @@ export class HarnessCommandExecutor implements CommandExecutor {
     subprocess: SubprocessRuntime,
     argv: readonly string[],
     cwd: string,
-    options: {
-      readonly signal?: AbortSignal | undefined
-      readonly timeoutMs?: number
-      readonly env?: Readonly<Record<string, string | undefined>>
-      readonly maxOutputBytes?: number
-    },
+    options: CommandRunOptions,
   ): Promise<CommandResult> {
     const started = Date.now()
     const maxOutputBytes = options.maxOutputBytes ?? 1024 * 1024
@@ -69,14 +67,19 @@ export class HarnessCommandExecutor implements CommandExecutor {
       cwd,
       stdio: {
         stdin: 'ignore',
-        stdout: { maxBytes: maxOutputBytes },
-        stderr: { maxBytes: maxOutputBytes },
+        stdout: 'pipe',
+        stderr: 'pipe',
       },
       graceMs: 2_000,
       signal,
       env: options.env,
     })
     let timedOut = false
+    const output = createOutputCollector(options.onOutput, maxOutputBytes)
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
+    handle.stdout?.on('data', chunk => output.append('stdout', stdoutDecoder.write(Buffer.from(chunk as Uint8Array))))
+    handle.stderr?.on('data', chunk => output.append('stderr', stderrDecoder.write(Buffer.from(chunk as Uint8Array))))
     const timeoutListener = (): void => {
       timedOut = options.timeoutMs !== undefined && timeout?.aborted === true
       handle.terminate()
@@ -85,13 +88,15 @@ export class HarnessCommandExecutor implements CommandExecutor {
     try {
       const outcome = await handle.done
       await handle.waitForExit()
+      output.append('stdout', stdoutDecoder.end())
+      output.append('stderr', stderrDecoder.end())
       return {
         argv,
         cwd,
         exitCode: outcome.exitCode,
         signal: outcome.signal,
-        stdout: readCollected(handle.collected.stdout),
-        stderr: readCollected(handle.collected.stderr),
+        stdout: output.stdout || readCollected(handle.collected.stdout),
+        stderr: output.stderr || readCollected(handle.collected.stderr),
         timedOut,
         durationMs: Date.now() - started,
       }
@@ -105,6 +110,35 @@ function readCollected(reader: { readFrom(offset: number): { text: string } } | 
   return reader?.readFrom(0).text ?? ''
 }
 
+interface CommandOutputCollector {
+  append(stream: CommandOutputStream, text: string): void
+  readonly stdout: string
+  readonly stderr: string
+}
+
+function createOutputCollector(
+  onOutput: CommandRunOptions['onOutput'],
+  maxOutputBytes: number,
+): CommandOutputCollector {
+  let stdout = ''
+  let stderr = ''
+  const append = (stream: CommandOutputStream, text: string): void => {
+    if (text.length === 0) return
+    if (stream === 'stdout') stdout = tail(stdout + text, maxOutputBytes)
+    else stderr = tail(stderr + text, maxOutputBytes)
+    try {
+      onOutput?.(stream, text)
+    } catch {
+      // Progress observers are non-authoritative and cannot fail a command.
+    }
+  }
+  return {
+    append,
+    get stdout() { return stdout },
+    get stderr() { return stderr },
+  }
+}
+
 async function runWithNode(
   argv: readonly string[],
   cwd: string,
@@ -113,6 +147,7 @@ async function runWithNode(
     readonly timeoutMs?: number
     readonly env?: Readonly<Record<string, string | undefined>>
     readonly maxOutputBytes?: number
+    readonly onOutput?: ((stream: CommandOutputStream, text: string) => void) | undefined
   },
 ): Promise<CommandResult> {
   const started = Date.now()
@@ -124,16 +159,12 @@ async function runWithNode(
     env: options.env === undefined ? undefined : mergeEnv(options.env),
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  let stdout = ''
-  let stderr = ''
+  const output = createOutputCollector(options.onOutput, maxOutputBytes)
   let timedOut = false
-  const append = (stream: 'stdout' | 'stderr', chunk: Buffer): void => {
-    const text = chunk.toString('utf8')
-    if (stream === 'stdout') stdout = tail(stdout + text, maxOutputBytes)
-    else stderr = tail(stderr + text, maxOutputBytes)
-  }
-  child.stdout?.on('data', chunk => append('stdout', Buffer.from(chunk as Uint8Array)))
-  child.stderr?.on('data', chunk => append('stderr', Buffer.from(chunk as Uint8Array)))
+  const stdoutDecoder = new StringDecoder('utf8')
+  const stderrDecoder = new StringDecoder('utf8')
+  child.stdout?.on('data', chunk => output.append('stdout', stdoutDecoder.write(Buffer.from(chunk as Uint8Array))))
+  child.stderr?.on('data', chunk => output.append('stderr', stderrDecoder.write(Buffer.from(chunk as Uint8Array))))
   const timeout = options.timeoutMs === undefined ? undefined : setTimeout(() => {
     timedOut = true
     child.kill()
@@ -147,13 +178,15 @@ async function runWithNode(
     if (timeout !== undefined) clearTimeout(timeout)
     options.signal?.removeEventListener('abort', abort)
   })
+  output.append('stdout', stdoutDecoder.end())
+  output.append('stderr', stderrDecoder.end())
   return {
     argv,
     cwd,
     exitCode: outcome.code,
     signal: outcome.signal,
-    stdout,
-    stderr,
+    stdout: output.stdout,
+    stderr: output.stderr,
     timedOut,
     durationMs: Date.now() - started,
   }

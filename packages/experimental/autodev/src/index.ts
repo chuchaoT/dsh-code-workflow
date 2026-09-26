@@ -5,7 +5,7 @@ import type { AutoDevConfig } from './contracts.ts'
 import { apply as applyTools } from './tools.ts'
 
 export const name = 'autodev'
-export const inject = ['tools']
+export const inject = ['tools', 'subagents']
 
 export function apply(ctx: Context, config: AutoDevConfig = {}): void {
   applyTools(ctx, config)
@@ -18,6 +18,7 @@ export { previewAutoDevRetention } from './retention.ts'
 export { GitManager } from './git.ts'
 export { HarnessCommandExecutor } from './command.ts'
 export { commandForDriver, detectBuildDrivers, selectBuildDriver } from './drivers.ts'
+export { codeBuddyTaskPrompt, resolveCodeBuddyEntry } from './codebuddy.ts'
 export { DecisionCoordinator, HttpJevProvider, StaticDecisionProvider, JevUnavailableError } from './jev.ts'
 export type { DecisionProvider, DecisionCoordinatorOptions, DecisionProviderRegistration, DecisionExecutionContext } from './jev.ts'
 export { OllamaDecisionProvider } from './ollama-decision.ts'

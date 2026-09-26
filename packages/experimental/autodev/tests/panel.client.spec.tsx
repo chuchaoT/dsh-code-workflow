@@ -8,6 +8,10 @@ import type { AutoDevSnapshot } from '../src/contracts.ts'
 
 afterEach(cleanup)
 
+function chooseTab(label: string): void {
+  fireEvent.click(screen.getByRole('tab', { name: label }))
+}
+
 describe('AutoDev sidebar task authoring', () => {
   it('requires explicit selection, a durable cleanup Job, and a typed second confirmation', async () => {
     const retentionPreview = {
@@ -46,6 +50,9 @@ describe('AutoDev sidebar task authoring', () => {
     } as unknown as AutoDevPanelProps
     render(<AutoDevPanel {...props} />)
 
+    chooseTab(zh.settingsTab)
+    expect(await screen.findByText(zh.providerSettingsUnavailable)).toBeTruthy()
+    chooseTab(zh.maintenanceTab)
     fireEvent.change(screen.getByLabelText(zh.minAgeDays), { target: { value: '30' } })
     fireEvent.click(screen.getByRole('button', { name: zh.previewRetention }))
     expect(await screen.findByText(/run-old · #2 · 60d/u)).toBeTruthy()
@@ -67,6 +74,105 @@ describe('AutoDev sidebar task authoring', () => {
       jobId: 'cleanup-job-12345678', snapshotFingerprint: 'f'.repeat(64), confirmationPhrase: 'DELETE-12345678',
     }))
     expect(await screen.findByText(/COMPLETED/u)).toBeTruthy()
+  })
+
+  it('loads and saves Profile-scoped provider settings without persisting Jev credentials', async () => {
+    const providerSettings = {
+      decisionBackend: 'ollama' as const,
+      ollamaEndpoint: 'http://127.0.0.1:11434',
+      ollamaModel: 'qwen3-coder',
+      analysisProvider: 'claude-code',
+      engineeringProvider: 'codex',
+      jevApiKeyEnv: 'TYPESAFE_API_KEY',
+      jevCredentialConfigured: false,
+      providers: [
+        { name: 'claude-code', kind: 'subagent' as const, available: true, traits: [] },
+        { name: 'codex', kind: 'subagent' as const, available: true, traits: [] },
+        { name: 'codebuddy', kind: 'command' as const, available: true, traits: ['cost-efficient'] },
+      ],
+      analysisProviders: [
+        { name: 'claude-code', kind: 'subagent' as const, available: true, traits: [] },
+        { name: 'codex', kind: 'subagent' as const, available: true, traits: [] },
+      ],
+      engineeringProviders: [
+        { name: 'codex', kind: 'subagent' as const, available: true, traits: [] },
+        { name: 'claude-code', kind: 'subagent' as const, available: true, traits: [] },
+        { name: 'codebuddy', kind: 'command' as const, available: true, traits: ['cost-efficient'] },
+      ],
+      activeRunCount: 0,
+    }
+    const providerSettingsRemote = vi.fn(async () => ({ ok: true as const, value: providerSettings }))
+    const updateProviderSettings = vi.fn(async (next: typeof providerSettings) => ({
+      ok: true as const, value: { ...providerSettings, ...next, decisionBackend: next.decisionBackend },
+    }))
+    const remote = {
+      list: vi.fn(async () => ({ ok: true as const, value: [] })),
+      providerSettings: providerSettingsRemote,
+      updateProviderSettings,
+    }
+    const props = {
+      useTabInfo: () => ({ tab: { id: 'autodev-provider-settings-tab' } }),
+      sessionId: 'session-provider-settings', remote,
+      t: (key: AutoDevKey) => zh[key],
+    } as unknown as AutoDevPanelProps
+    render(<AutoDevPanel {...props} />)
+
+    chooseTab(zh.settingsTab)
+    const backend = await screen.findByLabelText(zh.decisionBackend) as HTMLSelectElement
+    expect(backend.value).toBe('ollama')
+    expect((screen.getByLabelText(zh.ollamaModel) as HTMLInputElement).value).toBe('qwen3-coder')
+    fireEvent.change(backend, { target: { value: 'jev' } })
+    expect(screen.getByText(zh.jevCredentialSetup)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: zh.saveProviderSettings }))
+    await waitFor(() => expect(updateProviderSettings).toHaveBeenCalledWith({
+      decisionBackend: 'jev',
+      ollamaEndpoint: 'http://127.0.0.1:11434',
+      ollamaModel: 'qwen3-coder',
+      analysisProvider: 'claude-code',
+      engineeringProvider: 'codex',
+    }))
+    expect(JSON.stringify(updateProviderSettings.mock.calls[0]?.[0])).not.toContain('TYPESAFE_API_KEY')
+  })
+
+  it('separates task creation, Run list/details, provider settings, and maintenance into navigable tabs', async () => {
+    const snapshot = {
+      run: { id: 'run-tabs', status: 'DRAFT', request: 'Browse selected run', updatedAt: new Date().toISOString(), acceptanceCriteria: [] },
+      plan: undefined, nodes: [], evidence: [], verifications: [], verificationResults: [], signals: [], assumptions: [], uncertainties: [],
+      memories: [], knowledge: [], concepts: [], playbooks: [], knowledgeMergeProposals: [], actionIntents: [], gates: [], auditEvents: [],
+    } as unknown as AutoDevSnapshot
+    const remote = {
+      list: vi.fn(async () => ({ ok: true as const, value: [snapshot.run] })),
+      snapshot: vi.fn(async () => ({ ok: true as const, value: snapshot })),
+      candidateDiff: vi.fn(async () => ({ ok: true as const, value: undefined })),
+    }
+    const props = {
+      useTabInfo: () => ({ tab: { id: 'autodev-navigation-tab' } }),
+      sessionId: 'session-navigation', remote,
+      t: (key: AutoDevKey) => zh[key],
+    } as unknown as AutoDevPanelProps
+    render(<AutoDevPanel {...props} />)
+
+    const tabPanel = screen.getByRole('tabpanel')
+    expect(screen.getAllByRole('tab')).toHaveLength(5)
+    expect(screen.getByRole('tab', { name: zh.taskCreateTab }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByRole('heading', { name: zh.create })).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: zh.runHistory })).toBeNull()
+    expect(screen.queryByRole('heading', { name: zh.providerSettingsTitle })).toBeNull()
+
+    chooseTab(zh.settingsTab)
+    expect(screen.getByRole('heading', { name: zh.providerSettingsTitle })).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: zh.create })).toBeNull()
+    chooseTab(zh.maintenanceTab)
+    expect(screen.getByRole('region', { name: zh.backupRecovery })).toBeTruthy()
+
+    chooseTab(zh.taskCreateTab)
+    chooseTab(zh.runListTab)
+    expect(screen.getByRole('heading', { name: zh.runHistory })).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: zh.create })).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: /Browse selected run/u }))
+    await screen.findByRole('heading', { name: zh.details })
+    expect(screen.getByRole('tab', { name: zh.runDetailsTab }).getAttribute('aria-selected')).toBe('true')
+    expect(tabPanel.getAttribute('aria-labelledby')).toContain('details')
   })
 
   it('creates a task with separate acceptance criteria and displays its Plan without auto-starting', async () => {
@@ -121,6 +227,7 @@ describe('AutoDev sidebar task authoring', () => {
     await waitFor(() => expect(create).toHaveBeenCalledWith({
       repoPath: 'C:/isolated/repo', request: 'Add a test', mode: 'TEST', acceptanceCriteria: ['file exists', 'tests pass'], buildDriver: 'node',
     }))
+    expect(screen.getByRole('tab', { name: zh.runDetailsTab }).getAttribute('aria-selected')).toBe('true')
     expect(await screen.findByText(zh.reviewBeforeRun)).toBeTruthy()
     expect(screen.getByText(/Implement the change/)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: zh.approvePlan }))
@@ -130,6 +237,47 @@ describe('AutoDev sidebar task authoring', () => {
     expect(screen.getByLabelText(zh.auditTitle).textContent).toContain(zh.auditPlanApproved)
     fireEvent.click(screen.getByRole('button', { name: zh.startRun }))
     await waitFor(() => expect(start).toHaveBeenCalledWith({ runId: 'run-web-1', sessionId: 'session-web-panel' }))
+  })
+
+  it('renders partial Agent progress as unverified output on the active node', async () => {
+    const snapshot = {
+      run: {
+        id: 'run-progress', status: 'NEEDS_INTERVENTION', activePlanId: 'plan-progress',
+        request: 'Finish the implementation', updatedAt: new Date().toISOString(), acceptanceCriteria: [],
+      },
+      plan: {
+        id: 'plan-progress', version: 1, fingerprint: 'progress-fingerprint',
+        nodes: [{ id: 'implement', kind: 'implement', description: 'Implement the requested change' }],
+      },
+      nodes: [{
+        id: 'node-progress', runId: 'run-progress', planId: 'plan-progress', nodeId: 'implement',
+        attempt: 1, status: 'UNKNOWN',
+        agentProgress: {
+          status: 'PARTIAL', text: 'The Agent began editing but did not return a terminal response.',
+          activity: 'tool-started', updatedAt: new Date().toISOString(),
+        },
+      }],
+      evidence: [], verifications: [], verificationResults: [], signals: [], assumptions: [], uncertainties: [],
+      memories: [], knowledge: [], concepts: [], playbooks: [], knowledgeMergeProposals: [],
+      actionIntents: [], gates: [], auditEvents: [],
+    } as unknown as AutoDevSnapshot
+    const remote = {
+      list: vi.fn(async () => ({ ok: true as const, value: [snapshot.run] })),
+      snapshot: vi.fn(async () => ({ ok: true as const, value: snapshot })),
+      candidateDiff: vi.fn(async () => ({ ok: true as const, value: undefined })),
+    }
+    const props = {
+      useTabInfo: () => ({ tab: { id: 'autodev-progress-tab' } }),
+      sessionId: 'session-progress', remote,
+      t: (key: AutoDevKey) => zh[key],
+    } as unknown as AutoDevPanelProps
+    render(<AutoDevPanel {...props} />)
+    chooseTab(zh.runDetailsTab)
+
+    expect(await screen.findByText(zh.agentOutputUnverified)).toBeTruthy()
+    expect(screen.getByText(new RegExp(zh.agentProgressPartial, 'u'))).toBeTruthy()
+    expect(screen.getByText(new RegExp(zh.agentActivityToolStarted, 'u'))).toBeTruthy()
+    expect(screen.getByText('The Agent began editing but did not return a terminal response.')).toBeTruthy()
   })
 
   it('compares two Candidate revisions from the same Run with versioned verification metadata', async () => {
@@ -177,6 +325,7 @@ describe('AutoDev sidebar task authoring', () => {
       t: (key: AutoDevKey) => zh[key],
     } as unknown as AutoDevPanelProps
     render(<AutoDevPanel {...props} />)
+    chooseTab(zh.runDetailsTab)
 
     expect(await screen.findByText(zh.candidateComparison)).toBeTruthy()
     expect(await screen.findByText('diff for candidate-revision-a')).toBeTruthy()
@@ -225,6 +374,7 @@ describe('AutoDev sidebar task authoring', () => {
       t: (key: AutoDevKey) => zh[key],
     } as unknown as AutoDevPanelProps
     render(<AutoDevPanel {...props} />)
+    chooseTab(zh.runDetailsTab)
 
     await screen.findByRole('button', { name: zh.promote })
     for (const actionLabel of [zh.retry, zh.rework, zh.replan, zh.abandon, zh.cancel, zh.promote]) {
@@ -245,6 +395,7 @@ describe('AutoDev sidebar task authoring', () => {
     } as AutoDevSnapshot
     runs = [current.run]
     render(<AutoDevPanel {...props} />)
+    chooseTab(zh.runDetailsTab)
     fireEvent.click(await screen.findByRole('button', { name: zh.retry }))
     await waitFor(() => expect(resolveGate).toHaveBeenLastCalledWith({ runId: 'run-web-2', action: 'retry', sessionId: 'session-web-panel' }))
   })
@@ -301,6 +452,7 @@ describe('AutoDev sidebar task authoring', () => {
       t: (key: AutoDevKey) => zh[key],
     } as unknown as AutoDevPanelProps
     render(<AutoDevPanel {...props} />)
+    chooseTab(zh.runDetailsTab)
 
     const confirmButton = await screen.findByRole('button', { name: zh.confirmAssumption }) as HTMLButtonElement
     expect(confirmButton.disabled).toBe(true)
@@ -392,6 +544,7 @@ describe('AutoDev sidebar task authoring', () => {
       t: (key: AutoDevKey) => zh[key],
     } as unknown as AutoDevPanelProps
     render(<AutoDevPanel {...props} />)
+    chooseTab(zh.runDetailsTab)
 
     fireEvent.click(await screen.findByRole('button', { name: zh.proposeKnowledgeMerges }))
     await waitFor(() => expect(proposeKnowledgeMerges).toHaveBeenCalledWith({ runId: 'run-knowledge-ui' }))
@@ -489,6 +642,7 @@ describe('AutoDev sidebar task authoring', () => {
       t: (key: AutoDevKey) => zh[key],
     } as unknown as AutoDevPanelProps
     render(<AutoDevPanel {...props} />)
+    chooseTab(zh.runDetailsTab)
 
     await screen.findByLabelText(`${zh.playbookKey}: ${zh.createPlaybookDraft}`)
     fireEvent.click(screen.getByText(zh.createPlaybookDraft, { selector: 'summary' }))
@@ -620,6 +774,7 @@ describe('AutoDev sidebar task authoring', () => {
       t: (key: AutoDevKey) => zh[key],
     } as unknown as AutoDevPanelProps
     render(<AutoDevPanel {...props} />)
+    chooseTab(zh.runDetailsTab)
 
     const promoteButtons = await screen.findAllByRole('button', { name: zh.promoteKnowledgeCandidate }) as HTMLButtonElement[]
     const promoteButton = promoteButtons[0]!

@@ -25,8 +25,12 @@ function fakeParent(id = 'parent-1'): Agent {
   return { id: SessionId(id) } as unknown as Agent
 }
 
-const ALL_CAPS: SubagentCapabilities = { agentOptions: true, outputSchema: true, depthLimit: true, toolFilter: true, persona: true }
-const NO_CAPS: SubagentCapabilities = { agentOptions: false, outputSchema: false, depthLimit: false, toolFilter: false, persona: false }
+const ALL_CAPS: SubagentCapabilities = {
+  agentOptions: true, outputSchema: true, depthLimit: true, toolFilter: true, persona: true, progress: true,
+}
+const NO_CAPS: SubagentCapabilities = {
+  agentOptions: false, outputSchema: false, depthLimit: false, toolFilter: false, persona: false, progress: false,
+}
 
 function baseRequest(overrides: Partial<SubagentStartRequest> = {}): SubagentStartRequest {
   return {
@@ -190,6 +194,7 @@ describe('SubagentRuntime', () => {
     ['toolFilter', { toolFilter: { deny: ['bash'] } }],
     ['persona', { persona: 'reviewer' }],
     ['workspaceCwd', { workspaceCwd: process.cwd() }],
+    ['progress', { onProgress: () => {} }],
   ] as const)('rejects unsupported %s before provider startup', async (_capability, override) => {
     const { subagents } = await service()
     const provider = new StubProvider('weak', NO_CAPS)
@@ -209,6 +214,23 @@ describe('SubagentRuntime', () => {
       .rejects.toThrow()
     expect(provider.startCount).toBe(0)
     expect(() => { assertSubagentMaxDepth(undefined) }).not.toThrow()
+  })
+
+  it('contains progress-observer exceptions and forwards callbacks only through capable providers', async () => {
+    const { subagents } = await service()
+    const provider = new StubProvider('progress-capable')
+    subagents.registerProvider(provider)
+    const progress = vi.fn()
+    const run = await subagents.start('progress-capable', baseRequest({ onProgress: progress }))
+    const event = { type: 'assistant-delta', text: 'partial' } as const
+    expect(() => provider.lastRequest?.onProgress?.(event)).not.toThrow()
+    expect(progress).toHaveBeenCalledWith(event)
+    await expect(run.result).resolves.toMatchObject({ stopReason: 'completed' })
+    const throwing = await subagents.start('progress-capable', baseRequest({
+      onProgress: () => { throw new Error('display observer failed') },
+    }))
+    expect(() => provider.lastRequest?.onProgress?.(event)).not.toThrow()
+    await expect(throwing.result).resolves.toMatchObject({ stopReason: 'completed' })
   })
 
   it('publishes lifecycle only after async provider start and keeps parent scope', async () => {

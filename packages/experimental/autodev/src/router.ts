@@ -10,7 +10,7 @@ import type {
   RoutePolicy,
 } from './contracts.ts'
 import type { AgentAdapter, AgentAdapterRequest, AgentResult } from './protocol.ts'
-import { HarnessCommandExecutor, type CommandExecutor } from './command.ts'
+import { HarnessCommandExecutor, type CommandExecutor, type CommandOutputStream, type CommandResult } from './command.ts'
 import { answerOf, DecisionCoordinator, questionsFor, replaceQuestionChoices, type DecisionExecutionContext } from './jev.ts'
 import type { AutoDevStore } from './store.ts'
 
@@ -40,6 +40,18 @@ export interface CommandProviderOptions {
   readonly maxOutputBytes?: number
   readonly env?: Readonly<Record<string, string | undefined>>
   readonly executor?: CommandExecutor
+  /** Per-invocation parser for CLIs that stream structured output. */
+  readonly createOutputObserver?: (request: ProviderRunRequest) => CommandProviderOutputObserver
+}
+
+/** Normalized live and final output from a structured CLI process. */
+export interface CommandProviderOutputObserver {
+  onOutput(stream: CommandOutputStream, text: string): void
+  complete(result: CommandResult): {
+    readonly output: string
+    readonly diagnostic?: string
+    readonly failed?: boolean
+  }
 }
 
 /** Adapt an external CLI to the provider contract using bounded argv execution.
@@ -56,13 +68,16 @@ export function commandProvider(options: CommandProviderOptions): CustomProvider
     ...(options.isAvailable === undefined ? {} : { isAvailable: options.isAvailable }),
     async run(request) {
       const args = typeof options.args === 'function' ? options.args(request) : options.args
+      const outputObserver = options.createOutputObserver?.(request)
       const result = await executor.run([options.executable, ...args], request.cwd, {
         signal: request.signal,
         ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
         ...(options.maxOutputBytes === undefined ? {} : { maxOutputBytes: options.maxOutputBytes }),
         ...(options.env === undefined ? {} : { env: options.env }),
+        ...(outputObserver === undefined ? {} : { onOutput: (stream, text) => outputObserver.onOutput(stream, text) }),
       })
-      const output = [result.stdout, result.stderr].filter(Boolean).join('\n')
+      const observed = outputObserver?.complete(result)
+      const output = observed?.output ?? [result.stdout, result.stderr].filter(Boolean).join('\n')
       if (request.signal.aborted) {
         return { provider: request.provider, status: 'aborted', output, diagnostic: 'command provider was aborted' }
       }
@@ -77,8 +92,19 @@ export function commandProvider(options: CommandProviderOptions): CustomProvider
       if (result.signal !== null) {
         return { provider: request.provider, status: 'aborted', output, diagnostic: 'command provider was aborted' }
       }
+      if (observed?.failed === true) {
+        return {
+          provider: request.provider,
+          status: 'error',
+          output,
+          diagnostic: observed.diagnostic ?? 'command provider reported a failed result',
+        }
+      }
       if (result.exitCode !== 0) {
-        return { provider: request.provider, status: 'error', output, diagnostic: `command provider exited ${String(result.exitCode)}` }
+        return { provider: request.provider, status: 'error', output, diagnostic: observed?.diagnostic ?? `command provider exited ${String(result.exitCode)}` }
+      }
+      if (observed?.diagnostic !== undefined) {
+        return { provider: request.provider, status: 'error', output, diagnostic: observed.diagnostic }
       }
       return { provider: request.provider, status: 'completed', output }
     },
@@ -223,6 +249,22 @@ export class ProviderRouter {
     }
   }
 
+  /** Pin a route to an explicitly selected candidate, failing closed if it is unavailable.
+   * @param routeName Existing route identifier.
+   * @param providerName Provider present in that route, or undefined to restore Jev ordering.
+   */
+  setPreferredProvider(routeName: string, providerName: string | undefined): void {
+    const route = this.routes[requireText(routeName, 'AutoDev route name')]
+    if (route === undefined) throw new Error(`AutoDev route "${routeName}" is not registered`)
+    if (providerName === undefined || providerName.trim() === '') {
+      const { preferredProvider: _preferredProvider, ...policy } = route
+      this.routes[routeName] = policy
+      return
+    }
+    const normalizedProvider = requireText(providerName, 'AutoDev preferred provider name')
+    this.routes[routeName] = { ...route, preferredProvider: normalizedProvider }
+  }
+
   /** Return a detached route catalog suitable for a Remote or tool response.
    * @returns A shallow copy of the registered route policies.
    */
@@ -255,7 +297,10 @@ export class ProviderRouter {
     const required = [...new Set([...(policy.requiredTaskTraits ?? []), ...requiredTraits])]
     const rejections: { provider: string; reason: string }[] = []
     const eligible: RouteCandidate[] = []
-    for (const candidate of policy.candidates) {
+    const configuredCandidates = policy.preferredProvider === undefined
+      ? policy.candidates
+      : policy.candidates.filter(candidate => candidate.provider === policy.preferredProvider)
+    for (const candidate of configuredCandidates) {
       if (candidate.enabled === false) {
         rejections.push({ provider: candidate.provider, reason: 'disabled by route configuration' })
         continue
@@ -281,7 +326,9 @@ export class ProviderRouter {
     let confidence: number | undefined
     let decisionSource: RouteDecision['decisionSource']
     let decisionProviderId: string | undefined
-    let reason = 'no eligible provider'
+    let reason = policy.preferredProvider === undefined
+      ? 'no eligible provider'
+      : `preferred provider ${policy.preferredProvider} is unavailable or lacks required traits`
     if (eligible.length > 0) {
       const questions = replaceQuestionChoices(questionsFor(purpose), eligible.map(item => item.provider))
       const decision = await this.decisions.evaluate(purpose, {
@@ -301,7 +348,9 @@ export class ProviderRouter {
           ? 'Jev did not choose an eligible provider'
           : `Jev choice was invalid or below confidence ${threshold}; deterministic first eligible provider used`
       } else {
-        reason = `Jev selected ${selected.provider}`
+        reason = policy.preferredProvider === undefined
+          ? `Jev selected ${selected.provider}`
+          : `configured provider ${selected.provider} selected`
       }
     }
     const decision: RouteDecision = {
@@ -382,6 +431,9 @@ export class ProviderRouter {
       workspaceCwd: request.cwd,
       signal: request.signal,
       ...(candidate.model === undefined ? {} : { agentOptions: { model: candidate.model } as never }),
+      ...(request.onProgress === undefined || loadedSubagent.capabilities.progress !== true
+        ? {}
+        : { onProgress: request.onProgress }),
     })
     try {
       const result = await run.result
@@ -419,6 +471,7 @@ export class ProviderRouter {
           cwd: request.context.workspacePath,
           signal: request.signal,
           parentAgent: request.parentAgent,
+          ...(request.onProgress === undefined ? {} : { onProgress: request.onProgress }),
           task: request.task,
           context: request.context,
           emitSignal: request.emitSignal,

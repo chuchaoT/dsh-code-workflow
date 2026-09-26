@@ -14,8 +14,11 @@ import type {
   AutoDevAuditActor,
   AutoDevMode,
   AutoDevConfig,
+  AutoDevProviderSettings,
+  AutoDevProviderSettingsView,
   AutoDevRetentionPreview,
   AutoDevSnapshot,
+  AgentProgressSnapshot,
   ArtifactContent,
   BuildDriverId,
   BusinessConcept,
@@ -52,11 +55,12 @@ import type {
 import { HarnessCommandExecutor, type CommandExecutor, type CommandResult } from './command.ts'
 import { commandForDriver, detectBuildDrivers, selectBuildDriver, type DriverSettings } from './drivers.ts'
 import { GitManager, GitPromotionError, GitWorktreeCleanupError } from './git.ts'
-import { answerOf, DecisionCoordinator, JevUnavailableError, questionsFor, type DecisionProvider, type DecisionProviderRegistration } from './jev.ts'
+import { answerOf, DecisionCoordinator, HttpJevProvider, JevUnavailableError, questionsFor, type DecisionProvider, type DecisionProviderRegistration } from './jev.ts'
 import { OllamaDecisionProvider } from './ollama-decision.ts'
 import { SubagentDecisionProvider } from './subagent-decision.ts'
-import { ProviderRouter, type CustomProvider } from './router.ts'
-import { AgentProtocol, isValidAgentSignalEnvelope, MAX_AGENT_CONTEXT_CHARS, normalizeSignal, type AutoDevAgentContext, type AgentSignalEnvelope, type AgentTask } from './protocol.ts'
+import { commandProvider, ProviderRouter, type CustomProvider } from './router.ts'
+import { codeBuddyTaskPrompt, createCodeBuddyOutputObserver, resolveCodeBuddyEntry } from './codebuddy.ts'
+import { AgentProtocol, isValidAgentSignalEnvelope, MAX_AGENT_CONTEXT_CHARS, normalizeSignal, type AutoDevAgentContext, type AgentProgressUpdate, type AgentSignalEnvelope, type AgentTask } from './protocol.ts'
 import { AutoDevStore, defaultDataRoot } from './store.ts'
 import { defaultVerificationChecks, evaluateVerification } from './verification.ts'
 import { BusinessConceptService } from './concepts.ts'
@@ -119,6 +123,9 @@ const MAX_REMOTE_ARTIFACT_BYTES = 512 * 1024
 const MAX_CLEANUP_SELECTION = 10
 const CLEANUP_HEARTBEAT_MS = 10_000
 const CLEANUP_LEASE_MS = 60_000
+const PROVIDER_SETTINGS_KEY = 'provider-settings.v1'
+const OLLAMA_DECISION_PROVIDER_ID = 'autodev-ollama'
+const JEV_TRUSTED_PURPOSES: readonly DecisionPurpose[] = ['intent', 'agent-route', 'failure-action', 'quality', 'completion']
 
 /** Main Host-owned AutoDev service. */
 export class AutoDevRuntime extends TypertRemoteService {
@@ -151,8 +158,10 @@ export class AutoDevRuntime extends TypertRemoteService {
   /** Fully resolved and validated runtime settings. */
   readonly config: ResolvedAutoDevConfig
   private readonly activeRuns = new Map<string, ActiveRunOperation>()
+  private readonly managedDecisionDisposers = new Map<string, () => void>()
   private readonly runtimeInstanceId = randomUUID()
   private disposing = false
+  private providerSettings: AutoDevProviderSettings
 
   constructor(
     ctx: Context,
@@ -173,6 +182,43 @@ export class AutoDevRuntime extends TypertRemoteService {
       store: this.store,
       subagents: getService<SubagentRuntime>(ctx, 'subagents'),
     })
+    const codeBuddyEntry = resolveCodeBuddyEntry()
+    if (codeBuddyEntry !== undefined) {
+      this.registerRoutedProvider('implement', commandProvider({
+        name: 'codebuddy',
+        executable: process.execPath,
+        args: request => [
+          codeBuddyEntry,
+          '--print', '--output-format', 'stream-json', '--include-partial-messages',
+          '-y',
+          '--permission-mode', 'acceptEdits',
+          '--tools', 'Read,Edit,Write,Glob,Grep',
+          '--allowedTools', 'Read,Edit,Write,Glob,Grep',
+          '--max-turns', '8',
+          '--no-session-persistence',
+          codeBuddyTaskPrompt({ request: request.request, acceptanceCriteria: request.acceptanceCriteria, cwd: request.cwd }),
+        ],
+        traits: ['code-edit', 'local-workspace', 'cost-efficient'],
+        isAvailable: () => existsSync(codeBuddyEntry),
+        timeoutMs: this.config.agentTimeoutMs,
+        maxOutputBytes: 1024 * 1024,
+        executor: this.commands,
+        createOutputObserver: request => createCodeBuddyOutputObserver(request.onProgress),
+      }), { traits: ['code-edit', 'local-workspace'] })
+    }
+    const persistedSettings = this.store.getSetting<AutoDevProviderSettings>(PROVIDER_SETTINGS_KEY)
+    this.providerSettings = resolveProviderSettings(
+      persistedSettings,
+      this.config.decisions?.ollama?.endpoint,
+      this.config.decisions?.ollama?.model,
+      options.decisions === undefined && this.config.decisions === undefined ? 'ollama' : 'configured',
+      routeDefaultProvider(this.router, 'review', 'claude-code'),
+      routeDefaultProvider(this.router, 'implement', 'codex'),
+    )
+    const ollama = new OllamaDecisionProvider({ endpoint: this.providerSettings.ollamaEndpoint, model: this.providerSettings.ollamaModel })
+    this.configureDecisionBackend(this.providerSettings.decisionBackend, ollama)
+    applyPreferredProvider(this.router, 'review', this.providerSettings.analysisProvider)
+    applyPreferredProvider(this.router, 'implement', this.providerSettings.engineeringProvider)
     this.protocol = new AgentProtocol()
     this.semantics = new SemanticService(this.store)
     this.memory = new ProjectMemoryService(this.store)
@@ -413,6 +459,35 @@ export class AutoDevRuntime extends TypertRemoteService {
   @Remote('providers')
   remoteProviders(): ProviderCatalog {
     return { providers: this.listProviders(), routes: this.router.listRoutes() }
+  }
+
+  /** Read editable Agent and decision-backend settings without exposing credential values.
+   * @returns Current profile settings, provider availability, and a Jev credential-presence flag.
+   */
+  @Remote('providerSettings')
+  remoteProviderSettings(): AutoDevProviderSettingsView {
+    return this.providerSettingsView()
+  }
+
+  /** Persist and apply provider choices; changes are rejected while a Run is active.
+   * @param request Provider routing and local Ollama endpoint/model; no secrets are accepted.
+   * @param signal DSH Remote cancellation signal.
+   * @returns Updated safe settings view.
+   */
+  @Remote('updateProviderSettings')
+  remoteUpdateProviderSettings(request: AutoDevProviderSettings, signal: AbortSignal): AutoDevProviderSettingsView {
+    signal.throwIfAborted()
+    if (this.activeRuns.size > 0) throw new Error('AutoDev provider settings cannot change while a Run is active')
+    const next = normalizeProviderSettings(request)
+    assertPreferredCandidate(this.router, 'review', next.analysisProvider)
+    assertPreferredCandidate(this.router, 'implement', next.engineeringProvider)
+    const ollama = new OllamaDecisionProvider({ endpoint: next.ollamaEndpoint, model: next.ollamaModel })
+    this.store.setSetting(PROVIDER_SETTINGS_KEY, next)
+    this.providerSettings = next
+    this.configureDecisionBackend(next.decisionBackend, ollama)
+    this.router.setPreferredProvider('review', next.analysisProvider)
+    this.router.setPreferredProvider('implement', next.engineeringProvider)
+    return this.providerSettingsView()
   }
 
   /** Create a Run and immutable Plan for Web review without starting a Provider.
@@ -1242,6 +1317,40 @@ export class AutoDevRuntime extends TypertRemoteService {
     return this.router.list()
   }
 
+  private providerSettingsView(): AutoDevProviderSettingsView {
+    const jevApiKeyEnv = this.config.jev.apiKeyEnv ?? 'TYPESAFE_API_KEY'
+    const providers = this.listProviders()
+    return {
+      ...this.providerSettings,
+      jevApiKeyEnv,
+      jevCredentialConfigured: (process.env[jevApiKeyEnv] ?? '').trim().length > 0,
+      providers,
+      analysisProviders: routeProviderInfo(this.router, 'review', providers),
+      engineeringProviders: routeProviderInfo(this.router, 'implement', providers),
+      activeRunCount: this.activeRuns.size,
+    }
+  }
+
+  private configureDecisionBackend(backend: AutoDevProviderSettings['decisionBackend'], ollama: OllamaDecisionProvider): void {
+    if (backend === 'configured') {
+      for (const dispose of this.managedDecisionDisposers.values()) dispose()
+      this.managedDecisionDisposers.clear()
+      this.decisions.setActiveProvider(undefined)
+      return
+    }
+    if (!this.decisions.hasProvider(OLLAMA_DECISION_PROVIDER_ID)) {
+      const dispose = this.decisions.registerProvider(OLLAMA_DECISION_PROVIDER_ID, ollama, 100, ['intent', 'agent-route', 'failure-action', 'completion'])
+      this.managedDecisionDisposers.set(OLLAMA_DECISION_PROVIDER_ID, dispose)
+    } else if (this.managedDecisionDisposers.has(OLLAMA_DECISION_PROVIDER_ID)) {
+      this.decisions.replaceProvider(OLLAMA_DECISION_PROVIDER_ID, ollama)
+    }
+    if (backend === 'jev' && !this.decisions.hasProvider('jev-http')) {
+      const dispose = this.decisions.registerProvider('jev-http', new HttpJevProvider(this.config.jev), 0, JEV_TRUSTED_PURPOSES)
+      this.managedDecisionDisposers.set('jev-http', dispose)
+    }
+    this.decisions.setActiveProvider(backend === 'ollama' ? OLLAMA_DECISION_PROVIDER_ID : 'jev-http')
+  }
+
   /** Register a Provider for dynamic route selection.
    * @param provider - The adapter identity, capabilities, and run function.
    * @returns A disposer that unregisters this Provider.
@@ -1372,12 +1481,12 @@ export class AutoDevRuntime extends TypertRemoteService {
       await this.executeCompletion(run.id, operationSignal, parentAgent)
       return this.snapshot(run.id)
     } catch (error: unknown) {
-      if (error instanceof InterventionRequiredError) {
+      if (isAbort(error, operationSignal)) {
+        this.settleInterruptedRun(runId, 'Run execution was interrupted; inspect the retained Worktree before resuming')
+      } else if (error instanceof InterventionRequiredError) {
         this.openGate(run.id, error.message, error.options)
       } else if (error instanceof JevUnavailableError) {
         this.openGate(run.id, `no configured decision provider could produce a trusted result: ${error.message}`, ['retry', 'rework', 'cancel'])
-      } else if (isAbort(error, operationSignal)) {
-        this.settleInterruptedRun(runId, 'Run execution was interrupted; inspect the retained Worktree before resuming')
       } else {
         const message = errorMessage(error)
         this.transitionIfAllowed(run.id, 'FAILED', { lastError: message })
@@ -1676,231 +1785,400 @@ export class AutoDevRuntime extends TypertRemoteService {
     const run = this.requireRun(runId)
     const plan = this.activePlan(run)
     const mode = run.mode ?? 'DEV'
-    const readOnly = isReadOnlyMode(mode)
     this.assertSemanticPlanReady(run, plan)
-    const node = plan.nodes.find(item => item.kind !== 'build' && item.kind !== 'test')
-    if (node === undefined) throw new Error('active plan has no Agent task node')
-    const execution = this.beginNode(run, plan, node)
-    const selection = await this.router.select(runId, node.id, 'agent-route', node.routeName ?? (readOnly ? 'review' : 'implement'), {
-      request: run.request,
-      mode,
-      acceptanceCriteria: run.acceptanceCriteria,
-      availableProviders: this.router.list(),
-    }, readOnly ? ['read-only'] : ['code-edit', 'local-workspace'], signal, { parentAgent })
-    if (selection.candidate === undefined) {
-      const detail = readOnly ? 'no eligible read-only Agent Provider is loaded' : 'no eligible Coding Agent Provider is loaded'
-      this.failNode(execution, detail)
-      throw new Error(detail)
-    }
-    const action = this.sideEffects.plan({
-      runId,
-      nodeId: node.id,
-      kind: 'agent-workspace',
-      target: worktreePath,
-      risk: 'medium',
-      preconditions: ['isolated Worktree exists', 'clean candidate baseline'],
-      idempotencyKey: `${execution.id}:agent-workspace`,
-    })
-    this.sideEffects.authorize(action.id, `AutoDev selected provider ${selection.candidate.provider}`)
-    this.sideEffects.start(action.id)
-    const task: AgentTask = {
-      protocolVersion: 'dsh.agent.v1',
-      id: `${execution.id}:agent`,
-      runId,
-      planVersionId: plan.id,
-      nodeId: node.id,
-      attempt: run.attempt,
-      kind: readOnly ? mode === 'REVIEW' ? 'review' : 'analyze' : 'implement',
-      instruction: modeTaskInstruction(mode, run.request),
-      acceptanceCriteria: run.acceptanceCriteria,
-      workspacePath: worktreePath,
-      createdAt: new Date().toISOString(),
-    }
-    const memoryHits = this.memory.search(runScope(run), run.request, { limit: 4, maxChars: 500 })
-    const conceptHits = (plan.conceptIds ?? []).flatMap((id) => {
-      const concept = this.store.getConcept(id)
-      return concept !== undefined && concept.status !== 'DEPRECATED' && scopeApplies(runScope(run), concept.scope) ? [concept] : []
-    })
-    const assumptions = this.store.listAssumptions(runId).filter(item => scopeApplies(runScope(run), item.scope)).slice(-8)
-    const uncertainties = this.store.listUncertainties(runId).filter(item => scopeApplies(runScope(run), item.scope)).slice(-8)
-    const playbookHits = this.playbooks.search(runScope(run), run.request).slice(0, 4)
-    const knowledgeHits = this.knowledge.searchHits(runScope(run), run.request, { limit: 4, maxChars: 500 })
-    const memoryCards = memoryHits.map(hit => [
-      `id=${hit.memory.id}; ${hit.memory.kind}/${hit.memory.status}; confidence=${hit.memory.confidence.toFixed(2)}; reason=${hit.reason}`,
-      `${hit.memory.title}: ${hit.memory.content}`,
-      `sourceRefs=${hit.memory.sourceRefs.map(item => `${item.sourceType}:${item.sourceId}`).join(', ') || 'none'}; evidence=${hit.memory.evidenceIds.join(', ') || 'none'}`,
-    ].join('\n'))
-    const conceptCards = conceptHits.map(item => [
-      `id=${item.id}; key=${item.key}; version=${item.version}; status=${item.status}; confidence=${item.confidence.toFixed(2)}`,
-      `${item.name}: ${item.definition}`,
-      `target=${item.target}; effect=${item.effect}; evidenceCriteria=${item.evidenceCriteria.join('; ') || 'none'}`,
-      `sourceRefs=${item.sourceRefs.map(ref => `${ref.sourceType}:${ref.sourceId}`).join(', ') || 'none'}; evidence=${item.evidenceIds.join(', ') || 'none'}`,
-    ].join('\n'))
-    const assumptionCards = assumptions.map(item => [
-      `id=${item.id}; status=${item.status}; confidence=${item.confidence.toFixed(2)}; planId=${item.planId ?? 'unbound'}`,
-      `${item.statement}${item.rationale === undefined ? '' : `; rationale=${item.rationale}`}`,
-      `resolution=${item.resolution ?? 'none'}; evidence=${item.evidenceIds.join(', ') || 'none'}; sourceRefs=${item.sourceRefs.map(ref => `${ref.sourceType}:${ref.sourceId}`).join(', ') || 'none'}`,
-    ].join('\n'))
-    const uncertaintyCards = uncertainties.map(item => [
-      `id=${item.id}; status=${item.status}; severity=${item.severity}; planId=${item.planId ?? 'unbound'}`,
-      `${item.subject}: ${item.reason}`,
-      `alternatives=${item.alternatives.join('; ') || 'none'}; resolution=${item.resolution ?? 'none'}; sourceRefs=${item.sourceRefs.map(ref => `${ref.sourceType}:${ref.sourceId}`).join(', ') || 'none'}`,
-    ].join('\n'))
-    const playbookCards = playbookHits.map(item => [
-      `id=${item.id}; ${item.key} v${item.version}; ${item.status}; confidence=${item.confidence.toFixed(2)}`,
-      `${item.name}: ${item.purpose}`,
-      `targets=${item.targets.join('; ')}; effects=${item.effects.join('; ')}; exclusions=${item.exclusions?.join('; ') || 'none'}`,
-      `steps=${item.steps.join(' -> ')}; requiredEvidence=${item.requiredEvidence.join(', ') || 'none'}; sourceRefs=${item.sourceRefs.map(ref => `${ref.sourceType}:${ref.sourceId}`).join(', ') || 'none'}`,
-    ].join('\n'))
-    const knowledgeCards = knowledgeHits.map(hit => [
-      `id=${hit.knowledge.id}; ${hit.knowledge.kind}/${hit.knowledge.status}; ${hit.temperature}; confidence=${hit.knowledge.confidence.toFixed(2)}; reason=${hit.reason}`,
-      `${hit.knowledge.statement}: ${hit.knowledge.content}`,
-      `sourceRefs=${hit.knowledge.sourceRefs.map(item => `${item.sourceType}:${item.sourceId}`).join(', ') || 'none'}; evidence=${hit.knowledge.evidenceIds.join(', ') || 'none'}`,
-    ].join('\n'))
-    const boundedCards = boundAgentContextCards(memoryCards, conceptCards, playbookCards, assumptionCards, uncertaintyCards, knowledgeCards)
-    const context: AutoDevAgentContext = {
-      mode,
-      runId,
-      projectKey: run.repoRoot,
-      repoRoot: run.repoRoot,
-      baseCommit: run.baseCommit,
-      workspacePath: worktreePath,
-      planVersionId: plan.id,
-      nodeId: node.id,
-      attempt: run.attempt,
-      evidenceIds: this.store.listEvidence(runId).map(item => item.id).slice(-16),
-      memoryRefs: memoryHits.map(item => item.memory.id),
-      conceptRefs: conceptHits.map(item => item.id),
-      assumptionRefs: assumptions.map(item => item.id),
-      uncertaintyRefs: uncertainties.map(item => item.id),
-      playbookRefs: playbookHits.map(item => item.id),
-      knowledgeRefs: knowledgeHits.map(item => item.knowledge.id),
-      memoryCards: boundedCards.memoryCards,
-      conceptCards: boundedCards.conceptCards,
-      assumptionCards: boundedCards.assumptionCards,
-      uncertaintyCards: boundedCards.uncertaintyCards,
-      playbookCards: boundedCards.playbookCards,
-      knowledgeCards: boundedCards.knowledgeCards,
-      contextBudget: { maxChars: MAX_AGENT_CONTEXT_CHARS, usedChars: boundedCards.usedChars },
-    }
-    const contextArtifact = this.store.writeArtifact(runId, 'agent-context', JSON.stringify(context, null, 2), '.json')
-    this.store.saveEvidence({
-      id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'AGENT_CONTEXT', status: 'PASS',
-      source: 'runtime', artifactId: contextArtifact.id,
-      summary: `Provider context captured: ${boundedCards.usedChars}/${MAX_AGENT_CONTEXT_CHARS} summary characters; Memory=${memoryHits.length}, Concept=${conceptHits.length}, Assumption=${assumptions.length}, Uncertainty=${uncertainties.length}, Playbook=${playbookHits.length}, Knowledge=${knowledgeHits.length}.`,
-      createdAt: new Date().toISOString(),
-    })
-    let result: Awaited<ReturnType<AgentProtocol['execute']>>
-    try {
-      result = await this.protocol.execute(this.router.agentAdapter(selection.candidate), {
-        task,
-        context,
-        signal,
-        parentAgent,
-      })
-    } catch (error: unknown) {
-      this.sideEffects.unknown(action.id, `${selection.candidate.provider} invocation outcome is unknown`)
-      this.store.saveEvidence({ id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'SIDE_EFFECT', status: 'UNKNOWN', source: 'system', summary: `${selection.candidate.provider} workspace side effect outcome is unknown`, createdAt: new Date().toISOString() })
-      this.unknownNode(execution, errorMessage(error))
-      this.store.saveEvidence({
-        id: randomUUID(),
-        runId,
-        planId: plan.id,
-        nodeId: node.id,
-        attempt: run.attempt,
-        type: 'AGENT_OUTPUT',
-        status: 'UNKNOWN',
-        summary: `${selection.candidate.provider} threw after start; file and external side effects are unknown`,
-        createdAt: new Date().toISOString(),
-      })
-      throw new ExternalOutcomeUnknownError(`${selection.candidate.provider} invocation outcome is unknown`, { cause: error })
-    }
-    const outputArtifact = this.store.writeArtifact(runId, 'agent-output', result.output)
-    if (result.status !== 'completed' || signal.aborted) {
-      const diagnostic = result.diagnostic ?? (signal.aborted
-        ? 'cancellation was requested before the Provider confirmed completion'
-        : `Provider ${result.provider} ended with ${result.status}`)
-      const evidenceId = randomUUID()
-      this.sideEffects.unknown(action.id, diagnostic, [evidenceId])
-      this.store.saveEvidence({
-        id: evidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
-        type: 'SIDE_EFFECT', status: 'UNKNOWN', source: 'system', summary: `Agent workspace outcome is unknown: ${diagnostic}`, createdAt: new Date().toISOString(),
-      })
-      this.store.saveEvidence({
-        id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
-        type: 'AGENT_OUTPUT', status: 'UNKNOWN', source: 'agent', artifactId: outputArtifact.id,
-        summary: `Provider ${result.provider} did not confirm a completed implementation: ${diagnostic}`, createdAt: new Date().toISOString(),
-      })
-      this.unknownNode(execution, diagnostic)
-      throw new ExternalOutcomeUnknownError(`${result.provider} invocation outcome is unknown: ${diagnostic}`)
-    }
-    const outputTree = await this.git.treeHash(worktreePath, signal)
-    const agentEvidence = {
-      id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'AGENT_OUTPUT', status: 'PASS',
-      summary: `Provider ${result.provider} completed ${mode.toLowerCase()} task`,
-      ...(readOnly ? {} : { gitTreeHash: outputTree }), artifactId: outputArtifact.id, createdAt: new Date().toISOString(),
-    } as const
-    this.store.saveEvidence(agentEvidence)
-    if (readOnly) {
-      const baseTreeResult = await this.commands.run(['git', 'rev-parse', `${run.baseCommit}^{tree}`], worktreePath, { signal })
-      if (baseTreeResult.exitCode !== 0) throw new Error(`cannot inspect read-only baseline tree: ${baseTreeResult.stderr.trim()}`)
-      const worktreeState = await this.commands.run(['git', 'status', '--porcelain=v1', '--untracked-files=all', '--ignored'], worktreePath, { signal })
-      const unchanged = baseTreeResult.stdout.trim() === outputTree && worktreeState.exitCode === 0 && worktreeState.stdout.trim() === ''
-      const review = mode === 'REVIEW'
-      const reviewOutcome = review ? parseReviewOutcome(result.output) : undefined
-      const decisionEvidence = {
-        id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
-        type: review ? 'REVIEW' as const : 'ANALYSIS' as const,
-        status: unchanged && (!review || reviewOutcome === 'PASS') ? 'PASS' as const : 'WARN' as const,
-        source: 'agent' as const,
-        artifactId: outputArtifact.id,
-        summary: !unchanged
-          ? 'Read-only Agent modified the isolated Worktree; output is not accepted'
-          : review
-            ? reviewOutcome === 'PASS' ? 'Read-only Agent returned a structured review with no findings' : 'Review output was missing a valid PASS verdict; human review is required'
-            : `${mode} report captured from ${result.provider}`,
-        createdAt: new Date().toISOString(),
+    const agentNodes = plan.nodes.filter(item => item.kind !== 'build' && item.kind !== 'test')
+    if (agentNodes.length === 0) throw new Error('active plan has no Agent task node')
+    for (const node of agentNodes) {
+      const readOnly = node.kind !== 'implement'
+      const execution = this.beginNode(run, plan, node)
+      const selection = await this.router.select(runId, node.id, 'agent-route', node.routeName ?? (readOnly ? 'review' : 'implement'), {
+        request: run.request,
+        mode,
+        acceptanceCriteria: run.acceptanceCriteria,
+        availableProviders: this.router.list(),
+      }, readOnly ? ['read-only'] : ['code-edit', 'local-workspace'], signal, { parentAgent })
+      if (selection.candidate === undefined) {
+        const detail = readOnly ? 'no eligible read-only Agent Provider is loaded' : 'no eligible Coding Agent Provider is loaded'
+        this.failNode(execution, detail)
+        throw new Error(detail)
       }
-      this.store.saveEvidence(decisionEvidence)
-      if (!unchanged) {
-        this.sideEffects.fail(action.id, 'read-only Agent modified the isolated Worktree', [decisionEvidence.id])
+      const repositoryStateBefore = await this.git.captureWorkingState(run.repoRoot, signal)
+      const baselineDrift = this.git.baselineDrift(repositoryStateBefore, run.baseCommit, run.baselineKind ?? 'commit')
+      if (baselineDrift !== undefined) {
+        const summary = `Agent execution refused because ${baselineDrift}`
         this.store.saveEvidence({
           id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
-          type: 'DRIFT', status: 'FAIL', source: 'system', gitTreeHash: outputTree,
-          summary: 'Read-only mode changed the Candidate Worktree; original repository was not touched', createdAt: new Date().toISOString(),
+          type: 'DRIFT', status: 'FAIL', source: 'system', summary, createdAt: new Date().toISOString(),
         })
-        this.failNode(execution, 'read-only Agent modified the isolated Worktree')
-        throw new InterventionRequiredError('read-only mode modified files in its isolated Worktree; inspect the retained result and re-run with an explicit write mode if appropriate', ['abandon', 'cancel'])
+        this.failNode(execution, summary)
+        throw new InterventionRequiredError(summary, ['rework', 'replan', 'abandon', 'cancel'])
       }
-      this.sideEffects.commit(action.id, `read-only ${mode.toLowerCase()} report captured`, undefined, outputTree, [agentEvidence.id, decisionEvidence.id])
-      this.store.saveEvidence({
-        id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
-        type: 'SIDE_EFFECT', status: 'PASS', source: 'system',
-        summary: `${mode} Agent completed without changing the Worktree`, createdAt: new Date().toISOString(),
+      const action = this.sideEffects.plan({
+        runId,
+        nodeId: node.id,
+        kind: 'agent-workspace',
+        target: worktreePath,
+        risk: 'medium',
+        preconditions: ['isolated Worktree exists', 'clean candidate baseline'],
+        idempotencyKey: `${execution.id}:agent-workspace`,
       })
+      this.sideEffects.authorize(action.id, `AutoDev selected provider ${selection.candidate.provider}`)
+      this.sideEffects.start(action.id)
+      const task: AgentTask = {
+        protocolVersion: 'dsh.agent.v1',
+        id: `${execution.id}:agent`,
+        runId,
+        planVersionId: plan.id,
+        nodeId: node.id,
+        attempt: run.attempt,
+        kind: node.kind === 'review' ? 'review' : readOnly ? 'analyze' : 'implement',
+        instruction: `${modeTaskInstruction(mode, run.request)}\n\nCurrent Plan stage:\n${node.description}\n${readOnly ? 'This stage is strictly read-only; do not create, edit, or delete files.' : 'This stage may edit files only inside the isolated Worktree.'}`,
+        acceptanceCriteria: run.acceptanceCriteria,
+        workspacePath: worktreePath,
+        createdAt: new Date().toISOString(),
+      }
+      const memoryHits = this.memory.search(runScope(run), run.request, { limit: 4, maxChars: 500 })
+      const conceptHits = (plan.conceptIds ?? []).flatMap((id) => {
+        const concept = this.store.getConcept(id)
+        return concept !== undefined && concept.status !== 'DEPRECATED' && scopeApplies(runScope(run), concept.scope) ? [concept] : []
+      })
+      const assumptions = this.store.listAssumptions(runId).filter(item => scopeApplies(runScope(run), item.scope)).slice(-8)
+      const uncertainties = this.store.listUncertainties(runId).filter(item => scopeApplies(runScope(run), item.scope)).slice(-8)
+      const playbookHits = this.playbooks.search(runScope(run), run.request).slice(0, 4)
+      const knowledgeHits = this.knowledge.searchHits(runScope(run), run.request, { limit: 4, maxChars: 500 })
+      const memoryCards = memoryHits.map(hit => [
+        `id=${hit.memory.id}; ${hit.memory.kind}/${hit.memory.status}; confidence=${hit.memory.confidence.toFixed(2)}; reason=${hit.reason}`,
+        `${hit.memory.title}: ${hit.memory.content}`,
+        `sourceRefs=${hit.memory.sourceRefs.map(item => `${item.sourceType}:${item.sourceId}`).join(', ') || 'none'}; evidence=${hit.memory.evidenceIds.join(', ') || 'none'}`,
+      ].join('\n'))
+      const conceptCards = conceptHits.map(item => [
+        `id=${item.id}; key=${item.key}; version=${item.version}; status=${item.status}; confidence=${item.confidence.toFixed(2)}`,
+        `${item.name}: ${item.definition}`,
+        `target=${item.target}; effect=${item.effect}; evidenceCriteria=${item.evidenceCriteria.join('; ') || 'none'}`,
+        `sourceRefs=${item.sourceRefs.map(ref => `${ref.sourceType}:${ref.sourceId}`).join(', ') || 'none'}; evidence=${item.evidenceIds.join(', ') || 'none'}`,
+      ].join('\n'))
+      const assumptionCards = assumptions.map(item => [
+        `id=${item.id}; status=${item.status}; confidence=${item.confidence.toFixed(2)}; planId=${item.planId ?? 'unbound'}`,
+        `${item.statement}${item.rationale === undefined ? '' : `; rationale=${item.rationale}`}`,
+        `resolution=${item.resolution ?? 'none'}; evidence=${item.evidenceIds.join(', ') || 'none'}; sourceRefs=${item.sourceRefs.map(ref => `${ref.sourceType}:${ref.sourceId}`).join(', ') || 'none'}`,
+      ].join('\n'))
+      const uncertaintyCards = uncertainties.map(item => [
+        `id=${item.id}; status=${item.status}; severity=${item.severity}; planId=${item.planId ?? 'unbound'}`,
+        `${item.subject}: ${item.reason}`,
+        `alternatives=${item.alternatives.join('; ') || 'none'}; resolution=${item.resolution ?? 'none'}; sourceRefs=${item.sourceRefs.map(ref => `${ref.sourceType}:${ref.sourceId}`).join(', ') || 'none'}`,
+      ].join('\n'))
+      const playbookCards = playbookHits.map(item => [
+        `id=${item.id}; ${item.key} v${item.version}; ${item.status}; confidence=${item.confidence.toFixed(2)}`,
+        `${item.name}: ${item.purpose}`,
+        `targets=${item.targets.join('; ')}; effects=${item.effects.join('; ')}; exclusions=${item.exclusions?.join('; ') || 'none'}`,
+        `steps=${item.steps.join(' -> ')}; requiredEvidence=${item.requiredEvidence.join(', ') || 'none'}; sourceRefs=${item.sourceRefs.map(ref => `${ref.sourceType}:${ref.sourceId}`).join(', ') || 'none'}`,
+      ].join('\n'))
+      const knowledgeCards = knowledgeHits.map(hit => [
+        `id=${hit.knowledge.id}; ${hit.knowledge.kind}/${hit.knowledge.status}; ${hit.temperature}; confidence=${hit.knowledge.confidence.toFixed(2)}; reason=${hit.reason}`,
+        `${hit.knowledge.statement}: ${hit.knowledge.content}`,
+        `sourceRefs=${hit.knowledge.sourceRefs.map(item => `${item.sourceType}:${item.sourceId}`).join(', ') || 'none'}; evidence=${hit.knowledge.evidenceIds.join(', ') || 'none'}`,
+      ].join('\n'))
+      const boundedCards = boundAgentContextCards(
+        memoryCards,
+        conceptCards,
+        playbookCards,
+        assumptionCards,
+        uncertaintyCards,
+        knowledgeCards,
+      )
+      const context: AutoDevAgentContext = {
+        mode,
+        runId,
+        projectKey: run.repoRoot,
+        repoRoot: run.repoRoot,
+        baseCommit: run.baseCommit,
+        workspacePath: worktreePath,
+        planVersionId: plan.id,
+        nodeId: node.id,
+        attempt: run.attempt,
+        evidenceIds: this.store.listEvidence(runId).map(item => item.id).slice(-16),
+        memoryRefs: memoryHits.map(item => item.memory.id),
+        conceptRefs: conceptHits.map(item => item.id),
+        assumptionRefs: assumptions.map(item => item.id),
+        uncertaintyRefs: uncertainties.map(item => item.id),
+        playbookRefs: playbookHits.map(item => item.id),
+        knowledgeRefs: knowledgeHits.map(item => item.knowledge.id),
+        memoryCards: boundedCards.memoryCards,
+        conceptCards: boundedCards.conceptCards,
+        assumptionCards: boundedCards.assumptionCards,
+        uncertaintyCards: boundedCards.uncertaintyCards,
+        playbookCards: boundedCards.playbookCards,
+        knowledgeCards: boundedCards.knowledgeCards,
+        contextBudget: { maxChars: MAX_AGENT_CONTEXT_CHARS, usedChars: boundedCards.usedChars },
+      }
+      const contextArtifact = this.store.writeArtifact(runId, 'agent-context', JSON.stringify(context, null, 2), '.json')
+      this.store.saveEvidence({
+        id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'AGENT_CONTEXT', status: 'PASS',
+        source: 'runtime', artifactId: contextArtifact.id,
+        summary: `Provider context captured: ${boundedCards.usedChars}/${MAX_AGENT_CONTEXT_CHARS} summary characters; Memory=${memoryHits.length}, Concept=${conceptHits.length}, Assumption=${assumptions.length}, Uncertainty=${uncertainties.length}, Playbook=${playbookHits.length}, Knowledge=${knowledgeHits.length}.`,
+        createdAt: new Date().toISOString(),
+      })
+      let result: Awaited<ReturnType<AgentProtocol['execute']>>
+      const maxProgressChars = 8_000
+      let progressText = ''
+      let progressTruncated = false
+      let progressActivity: AgentProgressSnapshot['activity']
+      let lastProgressPersistAt = 0
+      let lastPersistedChars = 0
+      const persistAgentProgress = (status: AgentProgressSnapshot['status'], force = false): void => {
+        if (!force && Date.now() - lastProgressPersistAt < 750
+        && Math.abs(progressText.length - lastPersistedChars) < 512) return
+        const snapshot: AgentProgressSnapshot = {
+          status,
+          text: progressText,
+          ...(progressActivity === undefined ? {} : { activity: progressActivity }),
+          updatedAt: new Date().toISOString(),
+          ...(progressTruncated ? { truncated: true } : {}),
+        }
+        try {
+          this.store.saveNodeProgress(execution.id, execution, snapshot)
+          lastProgressPersistAt = Date.now()
+          lastPersistedChars = progressText.length
+        } catch {
+        // Live observability must not change the Agent's execution outcome.
+        }
+      }
+      const onAgentProgress = (event: AgentProgressUpdate): void => {
+        if (event === null || typeof event !== 'object') return
+        let changed = false
+        if (event.type === 'assistant-delta' && typeof event.text === 'string') {
+          if (event.text.length === 0) return
+          progressText += event.text
+          if (progressText.length > maxProgressChars) {
+            progressText = `[earlier output truncated]\n${progressText.slice(-(maxProgressChars - 28))}`
+            progressTruncated = true
+          }
+          changed = true
+        } else if (event.type === 'assistant-reset') {
+          progressText = ''
+          progressTruncated = false
+          changed = true
+        } else if (event.type === 'activity'
+        && ['working', 'tool-started', 'tool-completed'].includes(event.activity)) {
+          changed = progressActivity !== event.activity
+          progressActivity = event.activity
+        }
+        if (changed) persistAgentProgress('STREAMING', event.type !== 'assistant-delta')
+      }
+      const agentTimeoutController = new AbortController()
+      let agentTimedOut = false
+      const agentTimeoutHandle = setTimeout(() => {
+        if (signal.aborted) return
+        agentTimedOut = true
+        agentTimeoutController.abort(new Error(`AutoDev Agent timed out after ${this.config.agentTimeoutMs}ms`))
+      }, this.config.agentTimeoutMs)
+      const agentSignal = AbortSignal.any([signal, agentTimeoutController.signal])
+      try {
+        result = await this.protocol.execute(this.router.agentAdapter(selection.candidate), {
+          task,
+          context,
+          signal: agentSignal,
+          parentAgent,
+          onProgress: onAgentProgress,
+        })
+      } catch (error: unknown) {
+        clearTimeout(agentTimeoutHandle)
+        if (progressText.length > 0 || progressActivity !== undefined) {
+          persistAgentProgress('PARTIAL', true)
+        }
+        const invocationDiagnostic = agentTimedOut
+          ? `Agent timed out after ${this.config.agentTimeoutMs}ms; Provider completion was not confirmed`
+          : errorMessage(error)
+        let sourceChanged = false
+        let sourceInspectionFailed = false
+        try {
+          const repositoryStateAfterFailure = await this.git.captureWorkingState(run.repoRoot)
+          sourceChanged = !this.git.sameWorkingState(repositoryStateBefore, repositoryStateAfterFailure)
+        } catch {
+          sourceInspectionFailed = true
+        }
+        if (sourceChanged) {
+          const summary = `original repository changed while the Agent invocation failed (${invocationDiagnostic}); isolated execution is unverified and the candidate was rejected`
+          const outputEvidenceId = randomUUID()
+          const driftEvidenceId = randomUUID()
+          const sideEffectEvidenceId = randomUUID()
+          this.store.saveEvidence({
+            id: outputEvidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+            type: 'AGENT_OUTPUT', status: 'UNKNOWN', source: 'agent',
+            summary: `${selection.candidate.provider} ended without a result (${invocationDiagnostic}); original repository drift was detected`,
+            createdAt: new Date().toISOString(),
+          })
+          this.store.saveEvidence({
+            id: driftEvidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+            type: 'DRIFT', status: 'FAIL', source: 'system', summary, createdAt: new Date().toISOString(),
+          })
+          this.store.saveEvidence({
+            id: sideEffectEvidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+            type: 'SIDE_EFFECT', status: 'FAIL', source: 'system',
+            summary: 'Agent invocation changed the original repository outside its Worktree',
+            createdAt: new Date().toISOString(),
+          })
+          this.sideEffects.fail(action.id, summary, [outputEvidenceId, driftEvidenceId, sideEffectEvidenceId])
+          this.failNode(execution, summary)
+          throw new InterventionRequiredError(summary, ['rework', 'replan', 'abandon', 'cancel'])
+        }
+        this.sideEffects.unknown(action.id, `${selection.candidate.provider} invocation outcome is unknown: ${invocationDiagnostic}`)
+        this.store.saveEvidence({ id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'SIDE_EFFECT', status: 'UNKNOWN', source: 'system', summary: `${selection.candidate.provider} workspace side effect outcome is unknown: ${invocationDiagnostic}`, createdAt: new Date().toISOString() })
+        this.unknownNode(execution, invocationDiagnostic)
+        this.store.saveEvidence({
+          id: randomUUID(),
+          runId,
+          planId: plan.id,
+          nodeId: node.id,
+          attempt: run.attempt,
+          type: 'AGENT_OUTPUT',
+          status: 'UNKNOWN',
+          summary: sourceInspectionFailed
+            ? `${selection.candidate.provider} invocation ended without a result (${invocationDiagnostic}); source repository state could not be inspected, so file and external side effects are unknown`
+            : `${selection.candidate.provider} invocation ended without a result (${invocationDiagnostic}); file and external side effects are unknown`,
+          createdAt: new Date().toISOString(),
+        })
+        throw new ExternalOutcomeUnknownError(`${selection.candidate.provider} invocation outcome is unknown: ${invocationDiagnostic}`, { cause: error })
+      }
+      clearTimeout(agentTimeoutHandle)
+      if (result.output.length > 0) {
+        progressText = result.output
+        if (progressText.length > maxProgressChars) {
+          progressText = `[earlier output truncated]\n${progressText.slice(-(maxProgressChars - 28))}`
+          progressTruncated = true
+        }
+      }
+      persistAgentProgress(result.status === 'completed' ? 'COMPLETE' : 'PARTIAL', true)
+      const outputArtifact = this.store.writeArtifact(runId, 'agent-output', result.output)
+      const repositoryStateAfter = await this.git.captureWorkingState(run.repoRoot)
+      if (!this.git.sameWorkingState(repositoryStateBefore, repositoryStateAfter)) {
+        const summary = 'original repository changed during Agent execution; isolated execution is unverified and the candidate was rejected'
+        const outputEvidenceId = randomUUID()
+        const driftEvidenceId = randomUUID()
+        const sideEffectEvidenceId = randomUUID()
+        this.store.saveEvidence({
+          id: outputEvidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: 'AGENT_OUTPUT', status: 'FAIL', source: 'agent', artifactId: outputArtifact.id,
+          summary: `Provider ${result.provider} returned, but source repository isolation could not be verified`, createdAt: new Date().toISOString(),
+        })
+        this.store.saveEvidence({
+          id: driftEvidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: 'DRIFT', status: 'FAIL', source: 'system', summary, createdAt: new Date().toISOString(),
+        })
+        this.store.saveEvidence({
+          id: sideEffectEvidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: 'SIDE_EFFECT', status: 'FAIL', source: 'system', summary: 'Agent execution changed the original repository outside its Worktree', createdAt: new Date().toISOString(),
+        })
+        this.sideEffects.fail(action.id, summary, [outputEvidenceId, driftEvidenceId, sideEffectEvidenceId])
+        this.failNode(execution, summary)
+        throw new InterventionRequiredError(summary, ['rework', 'replan', 'abandon', 'cancel'])
+      }
+      if (result.status !== 'completed' || agentSignal.aborted) {
+        const diagnostic = agentTimedOut
+          ? `Agent timed out after ${this.config.agentTimeoutMs}ms; Provider completion was not confirmed`
+          : result.diagnostic ?? (signal.aborted
+            ? 'cancellation was requested before the Provider confirmed completion'
+            : `Provider ${result.provider} ended with ${result.status}`)
+        const evidenceId = randomUUID()
+        this.sideEffects.unknown(action.id, diagnostic, [evidenceId])
+        this.store.saveEvidence({
+          id: evidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: 'SIDE_EFFECT', status: 'UNKNOWN', source: 'system', summary: `Agent workspace outcome is unknown: ${diagnostic}`, createdAt: new Date().toISOString(),
+        })
+        this.store.saveEvidence({
+          id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: 'AGENT_OUTPUT', status: 'UNKNOWN', source: 'agent', artifactId: outputArtifact.id,
+          summary: `Provider ${result.provider} did not confirm a completed implementation: ${diagnostic}`, createdAt: new Date().toISOString(),
+        })
+        this.unknownNode(execution, diagnostic)
+        throw new ExternalOutcomeUnknownError(`${result.provider} invocation outcome is unknown: ${diagnostic}`)
+      }
+      const outputTree = await this.git.treeHash(worktreePath, signal)
+      const agentEvidence = {
+        id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'AGENT_OUTPUT', status: 'PASS',
+        summary: `Provider ${result.provider} completed ${mode.toLowerCase()} task`,
+        ...(readOnly ? {} : { gitTreeHash: outputTree }), artifactId: outputArtifact.id, createdAt: new Date().toISOString(),
+      } as const
+      if (readOnly) {
+        this.store.saveEvidence(agentEvidence)
+        const baseTreeResult = await this.commands.run(['git', 'rev-parse', `${run.baseCommit}^{tree}`], worktreePath, { signal })
+        if (baseTreeResult.exitCode !== 0) throw new Error(`cannot inspect read-only baseline tree: ${baseTreeResult.stderr.trim()}`)
+        const worktreeState = await this.commands.run(['git', 'status', '--porcelain=v1', '--untracked-files=all', '--ignored'], worktreePath, { signal })
+        const unchanged = baseTreeResult.stdout.trim() === outputTree && worktreeState.exitCode === 0 && worktreeState.stdout.trim() === ''
+        const review = node.kind === 'review' || mode === 'REVIEW'
+        const reviewOutcome = review ? parseReviewOutcome(result.output) : undefined
+        const decisionEvidence = {
+          id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: review ? 'REVIEW' as const : 'ANALYSIS' as const,
+          status: unchanged && (!review || reviewOutcome === 'PASS') ? 'PASS' as const : 'WARN' as const,
+          source: 'agent' as const,
+          artifactId: outputArtifact.id,
+          summary: !unchanged
+            ? 'Read-only Agent modified the isolated Worktree; output is not accepted'
+            : review
+              ? reviewOutcome === 'PASS' ? 'Read-only Agent returned a structured review with no findings' : 'Review output was missing a valid PASS verdict; human review is required'
+              : `${mode} report captured from ${result.provider}`,
+          createdAt: new Date().toISOString(),
+        }
+        this.store.saveEvidence(decisionEvidence)
+        if (!unchanged) {
+          this.sideEffects.fail(action.id, 'read-only Agent modified the isolated Worktree', [decisionEvidence.id])
+          this.store.saveEvidence({
+            id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+            type: 'DRIFT', status: 'FAIL', source: 'system', gitTreeHash: outputTree,
+            summary: 'Read-only mode changed the Candidate Worktree; original repository was not touched', createdAt: new Date().toISOString(),
+          })
+          this.failNode(execution, 'read-only Agent modified the isolated Worktree')
+          throw new InterventionRequiredError('read-only mode modified files in its isolated Worktree; inspect the retained result and re-run with an explicit write mode if appropriate', ['abandon', 'cancel'])
+        }
+        this.sideEffects.commit(action.id, `read-only ${mode.toLowerCase()} report captured`, undefined, outputTree, [agentEvidence.id, decisionEvidence.id])
+        this.store.saveEvidence({
+          id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: 'SIDE_EFFECT', status: 'PASS', source: 'system',
+          summary: `${mode} Agent completed without changing the Worktree`, createdAt: new Date().toISOString(),
+        })
+        this.completeNode(execution, selection.candidate.provider, outputTree)
+        const intervention = this.ingestAgentSignals(run, plan.id, task, selection.candidate.provider, result.signals)
+        if (intervention.reason !== undefined) throw new InterventionRequiredError(intervention.reason, intervention.options)
+        continue
+      }
+      const baseTreeResult = await this.commands.run(['git', 'rev-parse', `${run.baseCommit}^{tree}`], worktreePath, { signal })
+      if (baseTreeResult.exitCode !== 0) throw new Error(`cannot inspect implementation baseline tree: ${baseTreeResult.stderr.trim()}`)
+      if (baseTreeResult.stdout.trim() === outputTree) {
+        const summary = `Provider ${result.provider} reported completion but produced no changes in the isolated Worktree`
+        const sideEffectEvidenceId = randomUUID()
+        this.store.saveEvidence({
+          ...agentEvidence, status: 'WARN',
+          summary: `${summary}; Build and promotion were stopped`,
+        })
+        this.store.saveEvidence({
+          id: sideEffectEvidenceId, runId, planId: plan.id, nodeId: node.id, attempt: run.attempt,
+          type: 'SIDE_EFFECT', status: 'FAIL', source: 'system', summary, createdAt: new Date().toISOString(),
+        })
+        this.sideEffects.fail(action.id, summary, [agentEvidence.id, sideEffectEvidenceId])
+        this.failNode(execution, summary)
+        throw new InterventionRequiredError(summary, ['rework', 'replan', 'abandon', 'cancel'])
+      }
+      this.store.saveEvidence(agentEvidence)
+      const diff = await this.git.diff(worktreePath, run.baseCommit, signal)
+      const diffArtifact = this.store.writeArtifact(runId, 'candidate-diff', diff, '.patch')
+      const candidate: CandidateRevision = {
+        id: randomUUID(), runId, planId: plan.id, worktreePath, baseCommit: run.baseCommit,
+        gitTreeHash: outputTree, attempt: run.attempt, diffArtifactId: diffArtifact.id, createdAt: new Date().toISOString(),
+      }
+      this.store.saveCandidate(candidate)
+      this.store.updateRun(runId, current => ({ ...current, candidateId: candidate.id }))
       this.completeNode(execution, selection.candidate.provider, outputTree)
       const intervention = this.ingestAgentSignals(run, plan.id, task, selection.candidate.provider, result.signals)
+      if (intervention.unknownSideEffect) {
+        this.sideEffects.unknown(action.id, intervention.reason ?? 'unexpected Agent side effect was reported', [agentEvidence.id])
+        this.store.saveEvidence({ id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'SIDE_EFFECT', status: 'UNKNOWN', source: 'agent', summary: intervention.reason ?? 'unexpected Agent side effect was reported', createdAt: new Date().toISOString() })
+      } else {
+        this.sideEffects.commit(action.id, `sealed candidate ${candidate.id}`, undefined, outputTree, [agentEvidence.id])
+        this.store.saveEvidence({ id: randomUUID(), runId, candidateId: candidate.id, planId: plan.id, nodeId: node.id, attempt: run.attempt, gitTreeHash: outputTree, type: 'SIDE_EFFECT', status: 'PASS', source: 'system', summary: `Agent workspace side effect committed at ${outputTree}`, createdAt: new Date().toISOString() })
+      }
       if (intervention.reason !== undefined) throw new InterventionRequiredError(intervention.reason, intervention.options)
-      return
     }
-    const diff = await this.git.diff(worktreePath, run.baseCommit, signal)
-    const diffArtifact = this.store.writeArtifact(runId, 'candidate-diff', diff, '.patch')
-    const candidate: CandidateRevision = {
-      id: randomUUID(), runId, planId: plan.id, worktreePath, baseCommit: run.baseCommit,
-      gitTreeHash: outputTree, attempt: run.attempt, diffArtifactId: diffArtifact.id, createdAt: new Date().toISOString(),
-    }
-    this.store.saveCandidate(candidate)
-    this.store.updateRun(runId, current => ({ ...current, candidateId: candidate.id }))
-    this.completeNode(execution, selection.candidate.provider, outputTree)
-    const intervention = this.ingestAgentSignals(run, plan.id, task, selection.candidate.provider, result.signals)
-    if (intervention.unknownSideEffect) {
-      this.sideEffects.unknown(action.id, intervention.reason ?? 'unexpected Agent side effect was reported', [agentEvidence.id])
-      this.store.saveEvidence({ id: randomUUID(), runId, planId: plan.id, nodeId: node.id, attempt: run.attempt, type: 'SIDE_EFFECT', status: 'UNKNOWN', source: 'agent', summary: intervention.reason ?? 'unexpected Agent side effect was reported', createdAt: new Date().toISOString() })
-    } else {
-      this.sideEffects.commit(action.id, `sealed candidate ${candidate.id}`, undefined, outputTree, [agentEvidence.id])
-      this.store.saveEvidence({ id: randomUUID(), runId, candidateId: candidate.id, planId: plan.id, nodeId: node.id, attempt: run.attempt, gitTreeHash: outputTree, type: 'SIDE_EFFECT', status: 'PASS', source: 'system', summary: `Agent workspace side effect committed at ${outputTree}`, createdAt: new Date().toISOString() })
-    }
-    if (intervention.reason !== undefined) throw new InterventionRequiredError(intervention.reason, intervention.options)
   }
 
   private async executeBuild(runId: string, worktreePath: string, signal: AbortSignal): Promise<void> {
@@ -2175,9 +2453,11 @@ export class AutoDevRuntime extends TypertRemoteService {
       status: reviewStatus,
       source: reviewSource,
       ...(candidate === undefined ? {} : { candidateId: candidate.id, gitTreeHash: candidate.gitTreeHash }),
-      summary: typeof score === 'number'
-        ? `${trustedReview ? `${result.source} (${result.providerId ?? 'configured provider'})` : 'Untrusted decision provider'} quality score ${score}/${100}; minimum ${this.config.qualityMinScore}${needsReview ? '; additional human review requested' : ''}${trustedReview ? '' : '; this provider is not trusted to approve code review'}`
-        : 'Trusted quality score was not available; human review is required',
+      summary: !trustedReview
+        ? `Untrusted quality decision (${result.providerId ?? result.source}); human review is required`
+        : typeof score === 'number'
+          ? `${result.source} (${result.providerId ?? 'configured provider'}) quality score ${score}/${100}; minimum ${this.config.qualityMinScore}${needsReview ? '; additional human review requested' : ''}`
+          : 'Trusted quality score was not available; human review is required',
       createdAt: new Date().toISOString(),
     })
     this.recordVerification(runId)
@@ -2401,7 +2681,7 @@ export class AutoDevRuntime extends TypertRemoteService {
       policyOutcome: outcome, reason, createdAt: new Date().toISOString(),
     })
     this.store.saveEvidence({
-      id: randomUUID(), runId, type: 'JEV_DECISION', status: outcome === 'paused' ? 'WARN' : 'PASS',
+      id: randomUUID(), runId, type: 'JEV_DECISION', status: outcome === 'accepted' ? 'PASS' : 'WARN',
       source: result.source === 'static' || result.source === 'fallback' ? 'system' : result.source,
       summary: `${purpose}: ${reason}`, createdAt: new Date().toISOString(),
     })
@@ -2464,6 +2744,9 @@ export class AutoDevRuntime extends TypertRemoteService {
         this.store.saveNode({
           ...node,
           status: 'UNKNOWN',
+          ...(node.agentProgress?.status === 'STREAMING'
+            ? { agentProgress: { ...node.agentProgress, status: 'PARTIAL' } }
+            : {}),
           error: 'Host restarted while this node was running; outcome requires human review',
           endedAt: new Date().toISOString(),
         })
@@ -2632,15 +2915,18 @@ export class AutoDevRuntime extends TypertRemoteService {
   }
 
   private completeNode(execution: NodeExecution, provider: string | undefined, outputTree: string): void {
-    this.store.saveNode({ ...execution, status: 'COMPLETED', ...(provider === undefined ? {} : { provider }), outputTree, endedAt: new Date().toISOString() })
+    const current = this.store.getNode(execution.id) ?? execution
+    this.store.saveNode({ ...current, status: 'COMPLETED', ...(provider === undefined ? {} : { provider }), outputTree, endedAt: new Date().toISOString() })
   }
 
   private failNode(execution: NodeExecution, error: string): void {
-    this.store.saveNode({ ...execution, status: 'FAILED', error, endedAt: new Date().toISOString() })
+    const current = this.store.getNode(execution.id) ?? execution
+    this.store.saveNode({ ...current, status: 'FAILED', error, endedAt: new Date().toISOString() })
   }
 
   private unknownNode(execution: NodeExecution, error: string): void {
-    this.store.saveNode({ ...execution, status: 'UNKNOWN', error, endedAt: new Date().toISOString() })
+    const current = this.store.getNode(execution.id) ?? execution
+    this.store.saveNode({ ...current, status: 'UNKNOWN', error, endedAt: new Date().toISOString() })
   }
 
   private transition(runId: string, status: RunStatus, patch: Partial<Run> = {}): Run {
@@ -2746,6 +3032,7 @@ export interface ResolvedAutoDevConfig {
   readonly dataRoot: string
   readonly worktreeRoot: string
   readonly maxAttempts: number
+  readonly agentTimeoutMs: number
   readonly commandTimeoutMs: number
   readonly buildTimeoutMs: number
   readonly testTimeoutMs: number
@@ -2885,12 +3172,88 @@ function validateDecisionPipelineConfig(config: DecisionPipelineConfig | undefin
   return config
 }
 
+function resolveProviderSettings(
+  persisted: AutoDevProviderSettings | undefined,
+  endpoint: string | undefined,
+  model: string | undefined,
+  defaultBackend: AutoDevProviderSettings['decisionBackend'],
+  defaultAnalysisProvider: string,
+  defaultEngineeringProvider: string,
+): AutoDevProviderSettings {
+  const defaults: AutoDevProviderSettings = {
+    decisionBackend: defaultBackend,
+    ollamaEndpoint: endpoint ?? 'http://127.0.0.1:11434/api/chat',
+    ollamaModel: model ?? 'qwen3:8b-fast',
+    analysisProvider: defaultAnalysisProvider,
+    engineeringProvider: defaultEngineeringProvider,
+  }
+  try {
+    return normalizeProviderSettings(persisted === undefined ? defaults : { ...defaults, ...persisted })
+  } catch {
+    return normalizeProviderSettings(defaults)
+  }
+}
+
+function normalizeProviderSettings(value: unknown): AutoDevProviderSettings {
+  if (!isRecord(value)) throw new TypeError('AutoDev provider settings must be an object')
+  const decisionBackend = value.decisionBackend
+  if (decisionBackend !== 'ollama' && decisionBackend !== 'jev' && decisionBackend !== 'configured') {
+    throw new TypeError('decisionBackend must be ollama, jev, or configured')
+  }
+  const endpoint = requireProviderSettingText(value.ollamaEndpoint, 'ollamaEndpoint', 2048)
+  const model = requireProviderSettingText(value.ollamaModel, 'ollamaModel', 256)
+  const ollama = new OllamaDecisionProvider({ endpoint, model })
+  return {
+    decisionBackend,
+    ollamaEndpoint: ollama.endpoint,
+    ollamaModel: ollama.model,
+    analysisProvider: requireProviderSettingText(value.analysisProvider, 'analysisProvider', 128, true),
+    engineeringProvider: requireProviderSettingText(value.engineeringProvider, 'engineeringProvider', 128, true),
+  }
+}
+
+function requireProviderSettingText(value: unknown, name: string, maxLength: number, allowEmpty = false): string {
+  if (typeof value !== 'string') throw new TypeError(`${name} must be a string`)
+  const normalized = value.trim()
+  if ((!allowEmpty && normalized.length === 0) || normalized.length > maxLength) {
+    throw new TypeError(`${name} must be ${allowEmpty ? 'bounded' : 'non-empty and bounded'}`)
+  }
+  return normalized
+}
+
+function assertPreferredCandidate(router: ProviderRouter, routeName: string, providerName: string): void {
+  if (providerName === '') return
+  requireProviderSettingText(providerName, `${routeName} provider`, 128)
+  if (router.policy(routeName) === undefined) throw new Error(`AutoDev route "${routeName}" is not configured`)
+}
+
+function applyPreferredProvider(router: ProviderRouter, routeName: string, providerName: string): void {
+  router.setPreferredProvider(routeName, providerName === '' ? undefined : providerName)
+}
+
+function routeDefaultProvider(router: ProviderRouter, routeName: string, desired: string): string {
+  const isCandidate = router.policy(routeName)?.candidates.some(candidate => candidate.provider === desired) === true
+  const isLoaded = router.list().some(provider => provider.name === desired && provider.available)
+  return isCandidate && isLoaded ? desired : ''
+}
+
+function routeProviderInfo(router: ProviderRouter, routeName: string, providers: readonly ProviderInfo[]): readonly ProviderInfo[] {
+  const registered = new Map(providers.map(provider => [provider.name, provider]))
+  return (router.policy(routeName)?.candidates ?? []).map(candidate => registered.get(candidate.provider) ?? ({
+    name: candidate.provider,
+    kind: candidate.kind,
+    available: false,
+    traits: candidate.traits ?? [],
+  }))
+}
+
 function resolveConfig(config: AutoDevConfig): ResolvedAutoDevConfig {
   const dataRoot = resolve(config.dataRoot ?? defaultDataRoot())
   return {
     dataRoot,
     worktreeRoot: resolve(config.worktreeRoot ?? join(dataRoot, 'worktrees')),
     maxAttempts: positive(config.maxAttempts ?? 2, 'maxAttempts'),
+    agentTimeoutMs: positive(config.agentTimeoutMs ?? 5 * 60_000, 'agentTimeoutMs'),
     commandTimeoutMs: positive(config.commandTimeoutMs ?? 60_000, 'commandTimeoutMs'),
     buildTimeoutMs: positive(config.buildTimeoutMs ?? 10 * 60_000, 'buildTimeoutMs'),
     testTimeoutMs: positive(config.testTimeoutMs ?? 10 * 60_000, 'testTimeoutMs'),

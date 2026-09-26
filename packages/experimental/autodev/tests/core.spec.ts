@@ -939,6 +939,25 @@ describe('dynamic Provider routing', () => {
     expect(result.timedOut).toBe(false)
     expect(result.exitCode === 0 && result.signal === null).toBe(false)
   })
+
+  it('forwards live child stdout and stderr while retaining the final bounded result', async () => {
+    const root = tempRoot('command-live-output')
+    const events: Array<{ stream: string; text: string }> = []
+    const result = await new HarnessCommandExecutor().run([
+      process.execPath,
+      '-e',
+      "process.stdout.write('live-输出'); process.stderr.write('diagnostic')",
+    ], root, {
+      onOutput(stream, text) { events.push({ stream, text }) },
+    })
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toBe('live-输出')
+    expect(result.stderr).toBe('diagnostic')
+    expect(events.map(event => event.stream)).toContain('stdout')
+    expect(events.map(event => event.stream)).toContain('stderr')
+    expect(events.filter(event => event.stream === 'stdout').map(event => event.text).join('')).toBe('live-输出')
+  })
 })
 
 describe('restart recovery', () => {
@@ -2956,6 +2975,67 @@ describe('AutoDev end-to-end run', () => {
       expect(gated.evidence.find(item => item.type === 'TEST')?.status).toBe('PASS')
       expect(gated.evidence.find(item => item.type === 'REVIEW')?.status).toBe('WARN')
       expect(gated.gates.at(-1)?.reason).toContain('score 40/100')
+    } finally {
+      runtime.store.close()
+    }
+  })
+
+  it('marks degraded quality decisions as WARN without presenting fallback scores as trusted', async () => {
+    const root = tempRoot('degraded-quality-gate')
+    const stateRoot = tempRoot('degraded-quality-gate-state')
+    const worktreeRoot = tempRoot('degraded-quality-gate-worktrees')
+    await createGitRepo(root)
+    const decisions = new DecisionCoordinator({
+      config: { mode: 'advisory' },
+      provider: {
+        async evaluate(request) {
+          if (request.purpose === 'agent-route') {
+            return { source: 'jev', modelVersion: 'test', answers: [{ questionId: 'provider', kind: 'choice', value: 'quality-editor', probability: 1 }] }
+          }
+          if (request.purpose === 'quality') {
+            return {
+              source: 'local-model', modelVersion: 'test', answers: [
+                { questionId: 'score', kind: 'score', value: '100', probability: 1 },
+                { questionId: 'needs_review', kind: 'noul', value: false, probability: 1 },
+              ],
+            }
+          }
+          return { source: 'jev', modelVersion: 'test', answers: [{ questionId: 'completion', kind: 'choice', value: 'ready_for_verify', probability: 1 }] }
+        },
+      },
+    })
+    const runtime = new AutoDevRuntime(new Context(), {
+      dataRoot: stateRoot,
+      worktreeRoot,
+      jev: { mode: 'advisory' },
+      routes: {
+        implement: {
+          candidates: [{ kind: 'command', provider: 'quality-editor', traits: ['code-edit', 'local-workspace'] }],
+          requiredTaskTraits: ['code-edit', 'local-workspace'],
+        },
+      },
+    }, { commands: new FakeMavenExecutor(), decisions })
+    runtime.registerProvider({
+      name: 'quality-editor',
+      kind: 'command',
+      traits: ['code-edit', 'local-workspace'],
+      workspaceCwd: true,
+      run: async (request) => {
+        writeFileSync(join(request.cwd, 'QUALITY_GATE.txt'), 'implemented\n')
+        return { provider: request.provider, status: 'completed', output: 'created quality fixture' }
+      },
+    })
+    try {
+      const created = await runtime.create({ repoPath: root, request: 'create a degraded quality gate fixture', mode: 'DEV' })
+      runtime.remoteApprovePlan({ runId: created.run.id, planId: created.plan!.id })
+      const gated = await runtime.run(created.run.id)
+      expect(gated.run.status).toBe('NEEDS_INTERVENTION')
+      expect(gated.evidence.find(item => item.type === 'BUILD')?.status).toBe('PASS')
+      expect(gated.evidence.find(item => item.type === 'TEST')?.status).toBe('PASS')
+      expect(gated.evidence.find(item => item.type === 'JEV_DECISION' && item.summary.startsWith('quality:'))?.status).toBe('WARN')
+      expect(gated.evidence.find(item => item.type === 'REVIEW')).toMatchObject({ status: 'WARN' })
+      expect(gated.evidence.find(item => item.type === 'REVIEW')?.summary).toContain('static-fallback')
+      expect(gated.evidence.find(item => item.type === 'REVIEW')?.summary).not.toContain('100/100')
     } finally {
       runtime.store.close()
     }

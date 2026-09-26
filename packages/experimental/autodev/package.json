@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-experimental-autodev",
   "description": "Safe, resumable software-engineering runs for DeepSeek Harness",
-  "version": "0.1.7-rc.1",
+  "version": "0.1.7-rc.2",
   "publishConfig": {
     "access": "public"
   },
@@ -96,10 +96,12 @@
     "typecheck": "tsc -b"
   },
   "files": [
-    "lib/*.js",
     "lib/index.js",
     "lib/client.js",
     "cordis.patch.yml",
+    "lib/contracts.js",
+    "lib/router.js",
+    "lib/router-*.js",
     "lib/types/**/*.d.ts",
     "lib/typert.host.js",
     "lib/typert.host.d.ts",

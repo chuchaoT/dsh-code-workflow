@@ -135,7 +135,15 @@ export interface SubagentCapabilities {
   readonly persona: boolean
   /** The provider applies a caller-supplied per-run workspace cwd instead of inheriting the parent's cwd. */
   readonly workspaceCwd?: boolean
+  /** The provider reports bounded assistant/activity progress through `onProgress`. */
+  readonly progress?: boolean
 }
+
+/** Safe, non-authoritative progress emitted while a one-shot subagent is running. */
+export type SubagentProgressEvent =
+  | { readonly type: 'assistant-delta'; readonly text: string }
+  | { readonly type: 'activity'; readonly activity: 'working' | 'tool-started' | 'tool-completed' }
+  | { readonly type: 'assistant-reset' }
 
 /**
  * What a caller asks for when starting a ONE-SHOT subagent. The tool layer
@@ -170,6 +178,13 @@ export interface SubagentStartRequest {
    * remaining turn work when it fires afterward.
    */
   readonly signal: AbortSignal
+  /**
+   * Optional synchronous observer for bounded assistant deltas and generic
+   * activity only. Providers must not send tool arguments, command text, or
+   * tool output through this callback. Observer failures never fail the run.
+   * Requires {@link SubagentCapabilities.progress} when present.
+   */
+  readonly onProgress?: (event: SubagentProgressEvent) => void
   /**
    * Optional host-Agent provider, model, reasoning-effort, and output-token
    * overrides. Requires {@link SubagentCapabilities.agentOptions}; in-process

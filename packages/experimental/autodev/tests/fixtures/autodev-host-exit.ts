@@ -79,6 +79,7 @@ runtime.registerProvider({
       writeFileSync(join(request.cwd, 'AUTODEV_PROMOTION_EFFECT.txt'), 'candidate-effect\n')
       return { provider: request.provider, status: 'completed', output: 'candidate ready for promotion interruption' }
     }
+    writeFileSync(join(request.cwd, 'AUTODEV_HOST_EXIT_CANDIDATE.txt'), `candidate for ${stage} interruption\n`)
     return { provider: request.provider, status: 'completed', output: `implementation ready for ${stage} interruption` }
   },
 })

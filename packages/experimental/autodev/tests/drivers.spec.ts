@@ -112,9 +112,10 @@ describe('Build/Test drivers', () => {
     expect(commandForDriver('pytest', 'test', python).argv.slice(1)).toEqual(['-m', 'pytest', '-q'])
   })
 
-  it('rejects missing and ambiguous project roots unless the caller explicitly selects a detected driver', () => {
+  it('requires markers for auto-detection but honors an explicit driver for greenfield and ambiguous roots', () => {
     const empty = tempRoot()
     expect(() => selectBuildDriver(empty)).toThrow(/no supported root Build\/Test driver/)
+    expect(selectBuildDriver(empty, 'node')).toBe('node')
 
     const monorepo = tempRoot()
     writeFileSync(join(monorepo, 'pom.xml'), '<project/>')
@@ -122,7 +123,7 @@ describe('Build/Test drivers', () => {
     expect(detectBuildDrivers(monorepo)).toEqual(['maven', 'node'])
     expect(() => selectBuildDriver(monorepo)).toThrow(/multiple root Build\/Test drivers/)
     expect(selectBuildDriver(monorepo, 'node')).toBe('node')
-    expect(() => selectBuildDriver(monorepo, 'pytest')).toThrow(/was not detected/)
+    expect(selectBuildDriver(monorepo, 'pytest')).toBe('pytest')
   })
 
   it('rejects NUL bytes and oversized custom argv instead of invoking a shell', () => {

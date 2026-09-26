@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useState, type KeyboardEvent, type ReactNode } from 'react'
 import type { ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ArtifactContent, AutoDevAuditActor, AutoDevAuditEvent, AutoDevCleanupJobView, AutoDevMode, AutoDevRetentionPreview, AutoDevSnapshot, BuildDriverId, CandidateRevisionSummary, HumanGate, Run } from '../contracts.ts'
+import type { ArtifactContent, AutoDevAuditActor, AutoDevAuditEvent, AutoDevCleanupJobView, AutoDevMode, AutoDevProviderSettings, AutoDevProviderSettingsView, AutoDevRetentionPreview, AutoDevSnapshot, BuildDriverId, CandidateRevisionSummary, HumanGate, Run } from '../contracts.ts'
 import { AutoDevBackupRecovery } from './AutoDevBackupRecovery.tsx'
 import { AutoDevKnowledgeReview } from './AutoDevKnowledgeReview.tsx'
 import { AutoDevKnowledgeLifecycle } from './AutoDevKnowledgeLifecycle.tsx'
@@ -13,6 +13,21 @@ import styles from './AutoDevPanel.module.css'
 import { AUTODEV_MODES } from '../mode.ts'
 
 type GateAction = HumanGate['options'][number]
+type PanelTab = 'create' | 'runs' | 'details' | 'settings' | 'maintenance'
+
+const PANEL_TABS: readonly PanelTab[] = ['create', 'runs', 'details', 'settings', 'maintenance']
+const PANEL_TAB_LABELS: Record<PanelTab, AutoDevKey> = {
+  create: 'taskCreateTab',
+  runs: 'runListTab',
+  details: 'runDetailsTab',
+  settings: 'settingsTab',
+  maintenance: 'maintenanceTab',
+}
+
+type ProviderSettingsRemote = {
+  providerSettings(): Promise<RemoteResult<AutoDevProviderSettingsView>>
+  updateProviderSettings(settings: AutoDevProviderSettings): Promise<RemoteResult<AutoDevProviderSettingsView>>
+}
 
 export interface AutoDevPanelInjected {
   readonly remote: ClientRemote['autodev']
@@ -81,7 +96,10 @@ function cleanupRequestId(): string {
 }
 
 export function AutoDevPanel({ sessionId, useTabInfo, remote, t }: AutoDevPanelProps): ReactNode {
+  const settingsRemote = remote as typeof remote & ProviderSettingsRemote
   const { tab } = useTabInfo()
+  const tabPrefix = `autodev-${useId()}`
+  const [activeTab, setActiveTab] = useState<PanelTab>('create')
   const [runs, setRuns] = useState<readonly Run[]>([])
   const [selected, setSelected] = useState<AutoDevSnapshot | undefined>()
   const [diff, setDiff] = useState<ArtifactContent | undefined>()
@@ -110,6 +128,9 @@ export function AutoDevPanel({ sessionId, useTabInfo, remote, t }: AutoDevPanelP
   const [retentionCleanupJobs, setRetentionCleanupJobs] = useState<readonly AutoDevCleanupJobView[]>([])
   const [activeCleanupJobId, setActiveCleanupJobId] = useState<string | undefined>()
   const [cleanupConfirmationText, setCleanupConfirmationText] = useState('')
+  const [providerSettings, setProviderSettings] = useState<AutoDevProviderSettingsView | undefined>()
+  const [providerSettingsBusy, setProviderSettingsBusy] = useState(false)
+  const [providerSettingsError, setProviderSettingsError] = useState<string | undefined>()
   const candidateHistory = selected?.candidateHistory ?? []
   const auditEvents = selected?.auditEvents ?? []
   const candidateHistoryKey = candidateHistory.map(candidate => candidate.id).join('\u0000')
@@ -178,6 +199,22 @@ export function AutoDevPanel({ sessionId, useTabInfo, remote, t }: AutoDevPanelP
 
   useEffect(() => { void refresh() }, [refresh])
   useEffect(() => {
+    let active = true
+    const loadProviderSettings = settingsRemote.providerSettings
+    if (typeof loadProviderSettings !== 'function') {
+      setProviderSettingsError(t('providerSettingsUnavailable'))
+      return () => { active = false }
+    }
+    void loadProviderSettings.call(settingsRemote).then((result) => {
+      if (!active) return
+      setProviderSettings(unwrap(result))
+      setProviderSettingsError(undefined)
+    }).catch((cause: unknown) => {
+      if (active) setProviderSettingsError(errorText(cause))
+    })
+    return () => { active = false }
+  }, [settingsRemote, t])
+  useEffect(() => {
     if (inFlightRunId === undefined) return
     const timer = setInterval(() => { void refresh(inFlightRunId) }, 2_000)
     return () => { clearInterval(timer) }
@@ -198,6 +235,7 @@ export function AutoDevPanel({ sessionId, useTabInfo, remote, t }: AutoDevPanelP
       setSelected(next)
       setRequest('')
       setAcceptanceCriteria('')
+      setActiveTab('details')
       await refresh(next.run.id)
     } catch (cause: unknown) {
       setError(errorText(cause))
@@ -367,6 +405,66 @@ export function AutoDevPanel({ sessionId, useTabInfo, remote, t }: AutoDevPanelP
     }
   }
 
+  const saveProviderSettings = async (): Promise<void> => {
+    if (providerSettings === undefined) return
+    const update = settingsRemote.updateProviderSettings
+    if (typeof update !== 'function') {
+      setProviderSettingsError(t('providerSettingsUnavailable'))
+      return
+    }
+    setProviderSettingsBusy(true)
+    setProviderSettingsError(undefined)
+    try {
+      setProviderSettings(unwrap(await update.call(settingsRemote, {
+        decisionBackend: providerSettings.decisionBackend,
+        ollamaEndpoint: providerSettings.ollamaEndpoint,
+        ollamaModel: providerSettings.ollamaModel,
+        analysisProvider: providerSettings.analysisProvider,
+        engineeringProvider: providerSettings.engineeringProvider,
+      })))
+    } catch (cause: unknown) {
+      setProviderSettingsError(errorText(cause))
+    } finally {
+      setProviderSettingsBusy(false)
+    }
+  }
+
+  const updateProviderSettings = (patch: Partial<AutoDevProviderSettingsView>): void => {
+    setProviderSettings(current => current === undefined ? current : { ...current, ...patch })
+  }
+
+  const selectRun = async (runId: string): Promise<void> => {
+    setActiveTab('details')
+    await refresh(runId)
+  }
+
+  const onTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>): void => {
+    const currentIndex = PANEL_TABS.indexOf(activeTab)
+    const nextIndex = event.key === 'ArrowRight'
+      ? (currentIndex + 1) % PANEL_TABS.length
+      : event.key === 'ArrowLeft'
+        ? (currentIndex + PANEL_TABS.length - 1) % PANEL_TABS.length
+        : event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? PANEL_TABS.length - 1
+            : undefined
+    if (nextIndex === undefined) return
+    const nextTab = PANEL_TABS[nextIndex]
+    if (nextTab === undefined) return
+    event.preventDefault()
+    setActiveTab(nextTab)
+    document.getElementById(`${tabPrefix}-${nextTab}`)?.focus()
+  }
+
+  const providerOptions = (items: AutoDevProviderSettingsView['providers'], selected: string): ReactNode => <>
+    <option value="">{t('providerAutomatic')}</option>
+    {selected !== '' && !items.some(provider => provider.name === selected) && <option value={selected}>{selected} · {t('providerUnavailable')}</option>}
+    {items.map(provider => <option key={provider.name} value={provider.name}>
+      {provider.name} · {provider.available ? t('providerAvailable') : t('providerUnavailable')}
+    </option>)}
+  </>
+
   return <section data-autodev-panel className={styles.root}>
     <header className={styles.header}>
       <div className={styles.heading}>
@@ -375,275 +473,382 @@ export function AutoDevPanel({ sessionId, useTabInfo, remote, t }: AutoDevPanelP
       </div>
       <button className={styles.refreshButton} type="button" onClick={() => { void refresh() }} disabled={loading || busy}>{t('refresh')}</button>
     </header>
-    <form className={`${styles.card} ${styles.createCard}`} onSubmit={(event) => { event.preventDefault(); void create() }}>
-      <div className={styles.cardHeading}>
-        <h3 className={styles.cardTitle}>{t('create')}</h3>
-      </div>
-      <div className={styles.formGrid}>
-        <label className={styles.field}>{t('repoPath')}<input required value={repoPath} onChange={(event) => { setRepoPath(event.target.value) }} disabled={busy} /></label>
-        <label className={styles.field}>{t('mode')}<select value={mode} onChange={(event) => { setMode(event.target.value as AutoDevMode | 'AUTO') }} disabled={busy}>
-          <option value="AUTO">{t('modeAuto')}</option>
-          {AUTODEV_MODES.map(item => <option key={item} value={item}>{t(`mode${item}` as AutoDevKey)}</option>)}
-        </select></label>
-        <label className={styles.field}>{t('buildDriver')}<select value={buildDriver} onChange={(event) => { setBuildDriver(event.target.value as BuildDriverId | 'auto') }} disabled={busy}>
-          <option value="auto">{t('autoDriver')}</option>
-          <option value="maven">Maven</option><option value="gradle">Gradle</option><option value="node">Node</option><option value="pytest">pytest</option>
-        </select></label>
-        <label className={`${styles.field} ${styles.fullField}`}>{t('requestInput')}<textarea required value={request} onChange={(event) => { setRequest(event.target.value) }} rows={4} disabled={busy} /></label>
-        <label className={`${styles.field} ${styles.fullField}`}>{t('acceptanceCriteria')}<textarea value={acceptanceCriteria} onChange={(event) => { setAcceptanceCriteria(event.target.value) }} rows={3} disabled={busy} /></label>
-      </div>
-      <button className={styles.primaryButton} type="submit" disabled={busy || repoPath.trim() === '' || request.trim() === ''}>{busy ? t('creating') : t('create')}</button>
-    </form>
-    <AutoDevBackupRecovery remote={remote} t={t} />
-    {error !== undefined && <p className={styles.alert} role="alert">{t('error')}: {error}</p>}
-    {loading && runs.length === 0 && <p className={styles.emptyState}>{t('loading')}</p>}
-    {!loading && runs.length === 0 && <p className={styles.emptyState}>{t('empty')}</p>}
-    {runs.length > 0 && <div className={styles.runList}>
-      {runs.map(run => <button
-        key={run.id}
-        className={styles.runItem}
+    <nav className={styles.tabList} role="tablist" aria-label={t('panelNavigation')}>
+      {PANEL_TABS.map(panelTab => <button
+        key={panelTab}
+        id={`${tabPrefix}-${panelTab}`}
+        className={styles.tabButton}
         type="button"
-        onClick={() => { void refresh(run.id) }}
-        aria-pressed={run.id === selected?.run.id}
-        data-selected={run.id === selected?.run.id}
-      >
-        <span className={styles.statusBadge} data-status={run.status}>{run.status}</span>
-        <span className={styles.runRequest}>{run.request}</span>
-        <span className={styles.runTime}>{formatTime(run.updatedAt)}</span>
-      </button>)}
-    </div>}
-    <section data-autodev-section="retention" aria-label={t('retentionReview')}>
-      <strong>{t('retentionReview')}</strong>
-      <p className={styles.retentionNotice}>{t('retentionNotice')}</p>
-      <label className={styles.field}>{t('minAgeDays')} <input type="number" min={0} max={3650} step={1} value={retentionMinAgeDays}
-        onChange={(event) => {
-          setRetentionMinAgeDays(Number(event.currentTarget.value))
-          setRetentionPreview(undefined)
-          setRetentionSelectedIds([])
-          setActiveCleanupJobId(undefined)
-        }} /></label>
-      <button type="button" disabled={retentionBusy || !Number.isSafeInteger(retentionMinAgeDays) || retentionMinAgeDays < 0 || retentionMinAgeDays > 3650}
-        onClick={() => { void previewRetention() }}>{retentionBusy ? t('loadingRetention') : t('previewRetention')}</button>
-      {retentionPreview !== undefined && <div aria-live="polite">
-        <p style={{ margin: '4px 0' }}>{t('retentionEligible')}: {retentionPreview.eligibleWorktrees.length} · {t('retentionBlocked')}: {retentionPreview.blockedWorktrees.length}</p>
-        {retentionPreview.eligibleWorktrees.length === 0
-          ? <small>{t('retentionEmpty')}</small>
-          : <ul aria-label={t('retentionEligible')} style={{ marginTop: 4, paddingLeft: 18 }}>
-            {retentionPreview.eligibleWorktrees.map(item => <li key={item.retentionId}>
-              <label><input type="checkbox" aria-label={`${t('selectRetentionWorktree')}: ${item.runId} #${item.attempt}`}
-                checked={retentionSelectedIds.includes(item.retentionId)} disabled={retentionBusy}
-                onChange={() => { setRetentionSelectedIds(current => current.includes(item.retentionId)
-                  ? current.filter(id => id !== item.retentionId)
-                  : [...current, item.retentionId]) }} />
-              {item.runId} · #{item.attempt} · {item.ageDays}d
-              </label>
-            </li>)}
-          </ul>}
-        {retentionPreview.blockedWorktrees.length > 0 && <ul aria-label={t('retentionBlocked')} style={{ marginTop: 4, paddingLeft: 18 }}>
-          {retentionPreview.blockedWorktrees.map(item => <li key={item.retentionId}>{item.runId} · #{item.attempt}: {item.reasons.join(', ')}</li>)}
-        </ul>}
-        <p style={{ margin: '4px 0' }}>{t('selectedRetentionCount')}: {retentionSelectedIds.length}/10</p>
-        <button type="button" disabled={retentionBusy || retentionSelectedIds.length === 0 || retentionSelectedIds.length > 10}
-          onClick={() => { void prepareRetentionCleanup() }}>{retentionBusy ? t('preparingRetentionCleanup') : t('prepareRetentionCleanup')}</button>
-      </div>}
-      <p style={{ margin: '4px 0' }}><small>{t('retentionCleanupPathNotice')}</small></p>
-      <div aria-label={t('retentionCleanupJobs')}>
-        <strong>{t('retentionCleanupJobs')}</strong>
-        {retentionCleanupJobs.length === 0
-          ? <p style={{ margin: '4px 0' }}>{t('retentionCleanupNoJobs')}</p>
-          : retentionCleanupJobs.map(job => <div key={job.id} data-cleanup-job={job.id} style={{ borderTop: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', marginTop: 6, paddingTop: 6 }}>
-            <small>{job.status} · {job.id} · {t('retentionCleanupProgress')} {job.items.filter(item => item.status === 'REMOVED').length}/{job.items.length}</small>
-            {job.requestedBy !== undefined && <small style={{ display: 'block' }}>{t('auditActor')}: {auditActorLabel(job.requestedBy, t)}</small>}
-            {(job.events ?? []).length > 0 && <ul aria-label={t('auditTitle')} style={{ margin: '4px 0', paddingLeft: 18 }}>
-              {(job.events ?? []).slice(-8).map((event, index) => <li key={`${event.at}:${event.type}:${index}`}>
-                {cleanupEventLabel(event.type, t)} · {auditActorLabel(event.actor, t)} · {formatTime(event.at)}
-              </li>)}
+        role="tab"
+        aria-selected={activeTab === panelTab}
+        aria-controls={`${tabPrefix}-panel`}
+        tabIndex={activeTab === panelTab ? 0 : -1}
+        onClick={() => { setActiveTab(panelTab) }}
+        onKeyDown={onTabKeyDown}
+      >{t(PANEL_TAB_LABELS[panelTab])}</button>)}
+    </nav>
+    {error !== undefined && <p className={styles.alert} role="alert">{t('error')}: {error}</p>}
+    <div
+      id={`${tabPrefix}-panel`}
+      className={styles.tabPanel}
+      role="tabpanel"
+      aria-labelledby={`${tabPrefix}-${activeTab}`}
+      tabIndex={0}
+    >
+      <section className={`${styles.card} ${styles.providerSettings}`} aria-label={t('providerSettingsTitle')} hidden={activeTab !== 'settings'}>
+        <div className={styles.cardHeading}>
+          <h3 className={styles.cardTitle}>{t('providerSettingsTitle')}</h3>
+          {providerSettings !== undefined && <span className={styles.providerStatus}>{providerSettings.activeRunCount > 0 ? t('providerSettingsLocked') : t('providerSettingsReady')}</span>}
+        </div>
+        {providerSettings !== undefined ? <>
+          <p className={styles.providerNotice}>{t('providerSettingsNotice')}</p>
+          <div className={styles.formGrid}>
+            <label className={styles.field}>{t('decisionBackend')}<select value={providerSettings.decisionBackend}
+              onChange={(event) => { updateProviderSettings({ decisionBackend: event.target.value as 'ollama' | 'jev' | 'configured' }) }}>
+              <option value="ollama">Ollama · {t('providerLocal')}</option>
+              <option value="jev">Jev · {providerSettings.jevCredentialConfigured ? t('jevCredentialReady') : t('jevCredentialMissing')}</option>
+              <option value="configured">{t('providerConfigured')}</option>
+            </select></label>
+            <label className={styles.field}>{t('decisionBackendStatus')}
+              <input readOnly value={providerSettings.decisionBackend === 'ollama'
+                ? `${providerSettings.ollamaModel} · ${t('providerLocal')}`
+                : providerSettings.decisionBackend === 'jev'
+                  ? `${providerSettings.jevApiKeyEnv} · ${providerSettings.jevCredentialConfigured ? t('jevCredentialReady') : t('jevCredentialMissing')}`
+                  : t('providerConfigured')} />
+            </label>
+            <label className={styles.field}>{t('analysisProvider')}<select value={providerSettings.analysisProvider}
+              onChange={(event) => { updateProviderSettings({ analysisProvider: event.target.value }) }}>
+              {providerOptions(providerSettings.analysisProviders, providerSettings.analysisProvider)}
+            </select></label>
+            <label className={styles.field}>{t('engineeringProvider')}<select value={providerSettings.engineeringProvider}
+              onChange={(event) => { updateProviderSettings({ engineeringProvider: event.target.value }) }}>
+              {providerOptions(providerSettings.engineeringProviders, providerSettings.engineeringProvider)}
+            </select></label>
+            {providerSettings.decisionBackend === 'ollama' && <>
+              <label className={styles.field}>{t('ollamaEndpoint')}<input value={providerSettings.ollamaEndpoint}
+                onChange={(event) => { updateProviderSettings({ ollamaEndpoint: event.target.value }) }} /></label>
+              <label className={styles.field}>{t('ollamaModel')}<input value={providerSettings.ollamaModel}
+                onChange={(event) => { updateProviderSettings({ ollamaModel: event.target.value }) }} /></label>
+            </>}
+          </div>
+          {providerSettings.decisionBackend === 'jev' && <p className={providerSettings.jevCredentialConfigured ? styles.providerHelp : styles.providerWarning}>
+            {providerSettings.jevCredentialConfigured ? t('jevCredentialHelp') : t('jevCredentialSetup')} <code>{providerSettings.jevApiKeyEnv}</code>
+          </p>}
+          <div className={styles.actions}>
+            <button className={styles.primaryButton} type="button" onClick={() => { void saveProviderSettings() }}
+              disabled={providerSettingsBusy || providerSettings.activeRunCount > 0}>
+              {providerSettingsBusy ? t('providerSettingsSaving') : t('saveProviderSettings')}
+            </button>
+          </div>
+        </> : providerSettingsError !== undefined
+          ? <p className={styles.providerWarning} role="status">{providerSettingsError}</p>
+          : <p className={styles.providerNotice}>{t('providerSettingsLoading')}</p>}
+      </section>
+      <form className={`${styles.card} ${styles.createCard}`} onSubmit={(event) => { event.preventDefault(); void create() }} hidden={activeTab !== 'create'}>
+        <div className={styles.cardHeading}>
+          <h3 className={styles.cardTitle}>{t('create')}</h3>
+        </div>
+        <div className={styles.formGrid}>
+          <label className={styles.field}>{t('repoPath')}<input required value={repoPath} onChange={(event) => { setRepoPath(event.target.value) }} disabled={busy} /></label>
+          <label className={styles.field}>{t('mode')}<select value={mode} onChange={(event) => { setMode(event.target.value as AutoDevMode | 'AUTO') }} disabled={busy}>
+            <option value="AUTO">{t('modeAuto')}</option>
+            {AUTODEV_MODES.map(item => <option key={item} value={item}>{t(`mode${item}` as AutoDevKey)}</option>)}
+          </select></label>
+          <label className={styles.field}>{t('buildDriver')}<select value={buildDriver} onChange={(event) => { setBuildDriver(event.target.value as BuildDriverId | 'auto') }} disabled={busy}>
+            <option value="auto">{t('autoDriver')}</option>
+            <option value="maven">Maven</option><option value="gradle">Gradle</option><option value="node">Node</option><option value="pytest">pytest</option>
+          </select></label>
+          <label className={`${styles.field} ${styles.fullField}`}>{t('requestInput')}<textarea required value={request} onChange={(event) => { setRequest(event.target.value) }} rows={4} disabled={busy} /></label>
+          <label className={`${styles.field} ${styles.fullField}`}>{t('acceptanceCriteria')}<textarea value={acceptanceCriteria} onChange={(event) => { setAcceptanceCriteria(event.target.value) }} rows={3} disabled={busy} /></label>
+        </div>
+        <button className={styles.primaryButton} type="submit" disabled={busy || repoPath.trim() === '' || request.trim() === ''}>{busy ? t('creating') : t('create')}</button>
+      </form>
+      <div className={styles.tabPanelBlock} hidden={activeTab !== 'maintenance'}>
+        <AutoDevBackupRecovery remote={remote} t={t} />
+      </div>
+      <section className={`${styles.card} ${styles.runHistory}`} aria-label={t('runHistory')} hidden={activeTab !== 'runs'}>
+        <div className={styles.cardHeading}>
+          <h3 className={styles.cardTitle}>{t('runHistory')}</h3>
+          <span className={styles.runCount}>{runs.length}</span>
+        </div>
+        {loading && runs.length === 0 && <p className={styles.emptyState}>{t('loading')}</p>}
+        {!loading && runs.length === 0 && <p className={styles.emptyState}>{t('empty')}</p>}
+        {runs.length > 0 && <div className={styles.runList}>
+          {runs.map(run => <button
+            key={run.id}
+            className={styles.runItem}
+            type="button"
+            onClick={() => { void selectRun(run.id) }}
+            aria-pressed={run.id === selected?.run.id}
+            data-selected={run.id === selected?.run.id}
+          >
+            <span className={styles.statusBadge} data-status={run.status}>{run.status}</span>
+            <span className={styles.runRequest}>{run.request}</span>
+            <span className={styles.runTime}>{formatTime(run.updatedAt)}</span>
+          </button>)}
+        </div>}
+      </section>
+      <div className={styles.tabPanelBlock} hidden={activeTab !== 'maintenance'}>
+        <section data-autodev-section="retention" aria-label={t('retentionReview')}>
+          <strong>{t('retentionReview')}</strong>
+          <p className={styles.retentionNotice}>{t('retentionNotice')}</p>
+          <label className={styles.field}>{t('minAgeDays')} <input type="number" min={0} max={3650} step={1} value={retentionMinAgeDays}
+            onChange={(event) => {
+              setRetentionMinAgeDays(Number(event.currentTarget.value))
+              setRetentionPreview(undefined)
+              setRetentionSelectedIds([])
+              setActiveCleanupJobId(undefined)
+            }} /></label>
+          <button type="button" disabled={retentionBusy || !Number.isSafeInteger(retentionMinAgeDays) || retentionMinAgeDays < 0 || retentionMinAgeDays > 3650}
+            onClick={() => { void previewRetention() }}>{retentionBusy ? t('loadingRetention') : t('previewRetention')}</button>
+          {retentionPreview !== undefined && <div aria-live="polite">
+            <p style={{ margin: '4px 0' }}>{t('retentionEligible')}: {retentionPreview.eligibleWorktrees.length} · {t('retentionBlocked')}: {retentionPreview.blockedWorktrees.length}</p>
+            {retentionPreview.eligibleWorktrees.length === 0
+              ? <small>{t('retentionEmpty')}</small>
+              : <ul aria-label={t('retentionEligible')} style={{ marginTop: 4, paddingLeft: 18 }}>
+                {retentionPreview.eligibleWorktrees.map(item => <li key={item.retentionId}>
+                  <label><input type="checkbox" aria-label={`${t('selectRetentionWorktree')}: ${item.runId} #${item.attempt}`}
+                    checked={retentionSelectedIds.includes(item.retentionId)} disabled={retentionBusy}
+                    onChange={() => { setRetentionSelectedIds(current => current.includes(item.retentionId)
+                      ? current.filter(id => id !== item.retentionId)
+                      : [...current, item.retentionId]) }} />
+                  {item.runId} · #{item.attempt} · {item.ageDays}d
+                  </label>
+                </li>)}
+              </ul>}
+            {retentionPreview.blockedWorktrees.length > 0 && <ul aria-label={t('retentionBlocked')} style={{ marginTop: 4, paddingLeft: 18 }}>
+              {retentionPreview.blockedWorktrees.map(item => <li key={item.retentionId}>{item.runId} · #{item.attempt}: {item.reasons.join(', ')}</li>)}
             </ul>}
-            <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
-              {job.items.map(item => <li key={item.retentionId}>{item.runId} · #{item.attempt} · {item.status}{item.failureCode === undefined ? '' : ` (${item.failureCode})`}</li>)}
-            </ul>
-            {(job.status === 'AWAITING_CONFIRMATION' || job.status === 'NEEDS_ATTENTION' || job.status === 'EXECUTING') && <button type="button" disabled={retentionBusy}
-              onClick={() => { setActiveCleanupJobId(job.id); setCleanupConfirmationText('') }}>{t('resumeRetentionCleanup')}</button>}
-            {job.status === 'AWAITING_CONFIRMATION' && <button type="button" disabled={retentionBusy}
-              onClick={() => { void cancelRetentionCleanup(job.id) }}>{t('cancelRetentionCleanup')}</button>}
-          </div>)}
+            <p style={{ margin: '4px 0' }}>{t('selectedRetentionCount')}: {retentionSelectedIds.length}/10</p>
+            <button type="button" disabled={retentionBusy || retentionSelectedIds.length === 0 || retentionSelectedIds.length > 10}
+              onClick={() => { void prepareRetentionCleanup() }}>{retentionBusy ? t('preparingRetentionCleanup') : t('prepareRetentionCleanup')}</button>
+          </div>}
+          <p style={{ margin: '4px 0' }}><small>{t('retentionCleanupPathNotice')}</small></p>
+          <div aria-label={t('retentionCleanupJobs')}>
+            <strong>{t('retentionCleanupJobs')}</strong>
+            {retentionCleanupJobs.length === 0
+              ? <p style={{ margin: '4px 0' }}>{t('retentionCleanupNoJobs')}</p>
+              : retentionCleanupJobs.map(job => <div key={job.id} data-cleanup-job={job.id} style={{ borderTop: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', marginTop: 6, paddingTop: 6 }}>
+                <small>{job.status} · {job.id} · {t('retentionCleanupProgress')} {job.items.filter(item => item.status === 'REMOVED').length}/{job.items.length}</small>
+                {job.requestedBy !== undefined && <small style={{ display: 'block' }}>{t('auditActor')}: {auditActorLabel(job.requestedBy, t)}</small>}
+                {(job.events ?? []).length > 0 && <ul aria-label={t('auditTitle')} style={{ margin: '4px 0', paddingLeft: 18 }}>
+                  {(job.events ?? []).slice(-8).map((event, index) => <li key={`${event.at}:${event.type}:${index}`}>
+                    {cleanupEventLabel(event.type, t)} · {auditActorLabel(event.actor, t)} · {formatTime(event.at)}
+                  </li>)}
+                </ul>}
+                <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
+                  {job.items.map(item => <li key={item.retentionId}>{item.runId} · #{item.attempt} · {item.status}{item.failureCode === undefined ? '' : ` (${item.failureCode})`}</li>)}
+                </ul>
+                {(job.status === 'AWAITING_CONFIRMATION' || job.status === 'NEEDS_ATTENTION' || job.status === 'EXECUTING') && <button type="button" disabled={retentionBusy}
+                  onClick={() => { setActiveCleanupJobId(job.id); setCleanupConfirmationText('') }}>{t('resumeRetentionCleanup')}</button>}
+                {job.status === 'AWAITING_CONFIRMATION' && <button type="button" disabled={retentionBusy}
+                  onClick={() => { void cancelRetentionCleanup(job.id) }}>{t('cancelRetentionCleanup')}</button>}
+              </div>)}
+          </div>
+          {activeCleanupJob !== undefined && activeCleanupJob.status !== 'COMPLETED' && activeCleanupJob.status !== 'CANCELLED' && <div data-autodev-cleanup-confirmation>
+            <p style={{ margin: '4px 0' }}>{t('retentionConfirmationPrompt')} <code>{activeCleanupJob.confirmationPhrase}</code></p>
+            <label>{t('retentionConfirmationInput')} <input value={cleanupConfirmationText} disabled={retentionBusy}
+              onChange={(event) => { setCleanupConfirmationText(event.currentTarget.value) }} /></label>
+            <button className={styles.dangerButton} type="button" disabled={retentionBusy || cleanupConfirmationText !== activeCleanupJob.confirmationPhrase}
+              onClick={() => { void executeRetentionCleanup(activeCleanupJob) }}>{retentionBusy ? t('executingRetentionCleanup') : t('executeRetentionCleanup')}</button>
+          </div>}
+        </section>
       </div>
-      {activeCleanupJob !== undefined && activeCleanupJob.status !== 'COMPLETED' && activeCleanupJob.status !== 'CANCELLED' && <div data-autodev-cleanup-confirmation>
-        <p style={{ margin: '4px 0' }}>{t('retentionConfirmationPrompt')} <code>{activeCleanupJob.confirmationPhrase}</code></p>
-        <label>{t('retentionConfirmationInput')} <input value={cleanupConfirmationText} disabled={retentionBusy}
-          onChange={(event) => { setCleanupConfirmationText(event.currentTarget.value) }} /></label>
-        <button className={styles.dangerButton} type="button" disabled={retentionBusy || cleanupConfirmationText !== activeCleanupJob.confirmationPhrase}
-          onClick={() => { void executeRetentionCleanup(activeCleanupJob) }}>{retentionBusy ? t('executingRetentionCleanup') : t('executeRetentionCleanup')}</button>
-      </div>}
-    </section>
-    {selected !== undefined && <article className={styles.detailCard}>
-      <h3>{t('details')}</h3>
-      <p style={{ margin: '4px 0' }}><strong>{t('mode')}:</strong> {t(`mode${selected.run.mode ?? 'DEV'}` as AutoDevKey)} · {t(selected.run.modeSource === 'explicit' ? 'modeSelectionExplicit' : selected.run.modeSource === 'auto' ? 'modeSelectionAuto' : 'modeSelectionLegacy')}</p>
-      <p style={{ margin: '4px 0' }}><strong>{t('request')}:</strong> {selected.run.request}</p>
-      <p style={{ margin: '4px 0' }}><strong>{selected.run.status}</strong> · {selected.run.id}</p>
-      {selected.run.status === 'DRAFT' && <p style={{ margin: '4px 0', color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('reviewBeforeRun')}</p>}
-      {selected.run.status === 'READY' && <p style={{ margin: '4px 0', color: 'var(--dsw-alias-state-success-primary, #198754)' }}>{t('planApproved')}</p>}
-      {inFlightRunId === selected.run.id && <p style={{ margin: '4px 0', color: 'var(--dsw-alias-state-business-primary, #4176e6)' }}>{t('startingRun')}</p>}
-      {selected.plan !== undefined && <div><strong>{t('plan')}</strong> v{selected.plan.version}
-        <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>ID: {selected.plan.id} · {selected.plan.fingerprint} · {selected.plan.buildDriverId}</p>
-        {selected.run.acceptanceCriteria.length > 0 && <ul style={{ marginTop: 4, paddingLeft: 18 }}>{selected.run.acceptanceCriteria.map((item, index) => <li key={`${index}:${item}`}>{item}</li>)}</ul>}
-        <ul style={{ marginTop: 4, paddingLeft: 18 }}>{selected.plan.nodes.map((node) => {
-          const executions = selected.nodes.filter(item => item.planId === selected.plan?.id && item.nodeId === node.id)
-          const latest = executions.at(-1)
-          return <li key={node.id}>{node.id}: {latest?.status ?? 'PENDING'} — {node.description}</li>
-        })}</ul>
-        {selected.run.status === 'DRAFT' && <button type="button" disabled={busy} onClick={() => { void approvePlan() }}>{t('approvePlan')}</button>}
-        {selected.run.status === 'READY' && <button type="button" disabled={busy || inFlightRunId === selected.run.id} onClick={() => { void startRun() }}>{t('startRun')}</button>}
-      </div>}
-      <div><strong>{t('evidence')}</strong>
-        <ul style={{ marginTop: 4, paddingLeft: 18 }}>
-          {selected.evidence.slice(-8).map(item => (
-            <li key={item.id}>{item.type}: {item.status} — {item.summary}</li>
-          ))}
-        </ul>
-      </div>
-      <div aria-label={t('auditTitle')}><strong>{t('auditTitle')}</strong>
-        {auditEvents.length === 0
-          ? <p style={{ margin: '4px 0' }}>{t('auditEmpty')}</p>
-          : <ul style={{ marginTop: 4, paddingLeft: 18 }}>
-            {auditEvents.map(event => <li key={event.id}>
-              {formatTime(event.createdAt)} · {auditActionLabel(event.action, t)} ·{' '}
-              {auditActorLabel(event.actor, t)} · {event.result} · {event.resourceKind}:{' '}
-              {event.resourceId}
-            </li>)}
-          </ul>}
-      </div>
-      <div><strong>{t('verification')}</strong>
-        {selected.verifications.at(-1) === undefined
-          ? <p style={{ margin: '4px 0' }}>UNKNOWN</p>
-          : <p style={{ margin: '4px 0' }}>{selected.verifications.at(-1)?.status} — {selected.verifications.at(-1)?.summary}</p>}
-        {selected.verificationResults.length > 0 && (
+      {selected !== undefined && <article className={styles.detailCard} hidden={activeTab !== 'details'}>
+        <h3>{t('details')}</h3>
+        <p style={{ margin: '4px 0' }}><strong>{t('mode')}:</strong> {t(`mode${selected.run.mode ?? 'DEV'}` as AutoDevKey)} · {t(selected.run.modeSource === 'explicit' ? 'modeSelectionExplicit' : selected.run.modeSource === 'auto' ? 'modeSelectionAuto' : 'modeSelectionLegacy')}</p>
+        <p style={{ margin: '4px 0' }}><strong>{t('request')}:</strong> {selected.run.request}</p>
+        <p style={{ margin: '4px 0' }}><strong>{selected.run.status}</strong> · {selected.run.id}</p>
+        {selected.run.status === 'DRAFT' && <p style={{ margin: '4px 0', color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('reviewBeforeRun')}</p>}
+        {selected.run.status === 'READY' && <p style={{ margin: '4px 0', color: 'var(--dsw-alias-state-success-primary, #198754)' }}>{t('planApproved')}</p>}
+        {inFlightRunId === selected.run.id && <p style={{ margin: '4px 0', color: 'var(--dsw-alias-state-business-primary, #4176e6)' }}>{t('startingRun')}</p>}
+        {selected.plan !== undefined && <div><strong>{t('plan')}</strong> v{selected.plan.version}
+          <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>ID: {selected.plan.id} · {selected.plan.fingerprint} · {selected.plan.buildDriverId}</p>
+          {selected.run.acceptanceCriteria.length > 0 && <ul style={{ marginTop: 4, paddingLeft: 18 }}>{selected.run.acceptanceCriteria.map((item, index) => <li key={`${index}:${item}`}>{item}</li>)}</ul>}
+          <ul style={{ marginTop: 4, paddingLeft: 18 }}>{selected.plan.nodes.map((node) => {
+            const executions = selected.nodes.filter(item => item.planId === selected.plan?.id && item.nodeId === node.id)
+            const latest = executions.at(-1)
+            const progress = latest?.agentProgress
+            const progressStatus = progress?.status === 'STREAMING'
+              ? t('agentProgressStreaming')
+              : progress?.status === 'COMPLETE'
+                ? t('agentProgressComplete')
+                : t('agentProgressPartial')
+            const progressActivity = progress?.activity === 'working'
+              ? t('agentActivityWorking')
+              : progress?.activity === 'tool-started'
+                ? t('agentActivityToolStarted')
+                : progress?.activity === 'tool-completed'
+                  ? t('agentActivityToolCompleted')
+                  : undefined
+            return <li key={node.id}>{node.id}: {latest?.status ?? 'PENDING'} — {node.description}
+              {progress !== undefined && <div className={styles.agentProgress} role="status">
+                <div className={styles.agentProgressHeader}>
+                  <strong>{t('agentOutputUnverified')}</strong>
+                  <span>{progressStatus}{progressActivity === undefined ? '' : ` · ${progressActivity}`}</span>
+                </div>
+                {progress.text.length > 0 && <pre className={styles.agentProgressText}>{progress.text}</pre>}
+                {progress.truncated === true && <small>{t('agentProgressTruncated')}</small>}
+              </div>}
+            </li>
+          })}</ul>
+          {selected.run.status === 'DRAFT' && <button type="button" disabled={busy} onClick={() => { void approvePlan() }}>{t('approvePlan')}</button>}
+          {selected.run.status === 'READY' && <button type="button" disabled={busy || inFlightRunId === selected.run.id} onClick={() => { void startRun() }}>{t('startRun')}</button>}
+        </div>}
+        <div><strong>{t('evidence')}</strong>
           <ul style={{ marginTop: 4, paddingLeft: 18 }}>
-            {selected.verificationResults.slice(-4).map(item => (
-              <li key={item.id}>{item.status}: {item.reason}</li>
+            {selected.evidence.slice(-8).map(item => (
+              <li key={item.id}>{item.type}: {item.status} — {item.summary}</li>
             ))}
           </ul>
-        )}
-      </div>
-      <div><strong>{t('signals')}</strong>
-        {selected.signals.length === 0
-          ? <p style={{ margin: '4px 0' }}>{t('noSignals')}</p>
-          : <ul style={{ marginTop: 4, paddingLeft: 18 }}>
-            {selected.signals.slice(-8).map(item => (
-              <li key={item.id}>{item.provider}: {item.signal.type}</li>
-            ))}
-          </ul>}
-      </div>
-      <AutoDevSemanticReview snapshot={selected} remote={remote} t={t} busy={busy} onSnapshotAction={performSnapshotAction} />
-      <div><strong>{t('memory')}</strong>
-        <p style={{ margin: '4px 0' }}>{selected.memories.length} {t('memoryItems')} · {selected.knowledge.length} {t('knowledgeItems')} · {selected.concepts.length} {t('conceptItems')} · {selected.playbooks.length} {t('playbookItems')}</p>
-        {selected.memories.slice(-3).map(item => <p key={item.id} style={{ margin: '4px 0' }}>{item.status}: {item.title}</p>)}
-      </div>
-      <AutoDevKnowledgeReview snapshot={selected} remote={remote} t={t} busy={busy} onSnapshotAction={performSnapshotAction} />
-      <AutoDevKnowledgeLifecycle snapshot={selected} remote={remote} t={t} busy={busy} onSnapshotAction={performSnapshotAction} />
-      <AutoDevPlaybookReview snapshot={selected} remote={remote} t={t} busy={busy} onSnapshotAction={performSnapshotAction} />
-      <div><strong>{t('sideEffects')}</strong>
-        {selected.actionIntents.length === 0
-          ? <p style={{ margin: '4px 0' }}>{t('noSideEffects')}</p>
-          : <ul style={{ marginTop: 4, paddingLeft: 18 }}>
-            {selected.actionIntents.slice(-6).map(item => (
-              <li key={item.id}>{item.kind}: {item.status} — {item.target}</li>
-            ))}
-          </ul>}
-      </div>
-      <div><strong>{candidateHistory.length > 1 ? t('candidateComparison') : t('diff')}</strong>
-        {candidateHistory.length > 1
-          ? <>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 8, marginTop: 6 }}>
-              <label>{t('compareOlder')}
-                <select aria-label={t('compareOlder')} value={compareLeftId ?? ''} onChange={(event) => {
-                  const id = event.currentTarget.value
-                  if (id === compareRightId) setCompareRightId(compareLeftId)
-                  setCompareLeftId(id)
-                }}>
-                  {candidateHistory.map(candidate => (
-                    <option key={candidate.id} value={candidate.id}>
-                      {candidateOptionLabel(candidate)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>{t('compareNewer')}
-                <select aria-label={t('compareNewer')} value={compareRightId ?? ''} onChange={(event) => {
-                  const id = event.currentTarget.value
-                  if (id === compareLeftId) setCompareLeftId(compareRightId)
-                  setCompareRightId(id)
-                }}>
-                  {candidateHistory.map(candidate => (
-                    <option key={candidate.id} value={candidate.id}>
-                      {candidateOptionLabel(candidate)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-            {compareLeftId !== undefined &&
+        </div>
+        <div aria-label={t('auditTitle')}><strong>{t('auditTitle')}</strong>
+          {auditEvents.length === 0
+            ? <p style={{ margin: '4px 0' }}>{t('auditEmpty')}</p>
+            : <ul style={{ marginTop: 4, paddingLeft: 18 }}>
+              {auditEvents.map(event => <li key={event.id}>
+                {formatTime(event.createdAt)} · {auditActionLabel(event.action, t)} ·{' '}
+                {auditActorLabel(event.actor, t)} · {event.result} · {event.resourceKind}:{' '}
+                {event.resourceId}
+              </li>)}
+            </ul>}
+        </div>
+        <div><strong>{t('verification')}</strong>
+          {selected.verifications.at(-1) === undefined
+            ? <p style={{ margin: '4px 0' }}>UNKNOWN</p>
+            : <p style={{ margin: '4px 0' }}>{selected.verifications.at(-1)?.status} — {selected.verifications.at(-1)?.summary}</p>}
+          {selected.verificationResults.length > 0 && (
+            <ul style={{ marginTop: 4, paddingLeft: 18 }}>
+              {selected.verificationResults.slice(-4).map(item => (
+                <li key={item.id}>{item.status}: {item.reason}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div><strong>{t('signals')}</strong>
+          {selected.signals.length === 0
+            ? <p style={{ margin: '4px 0' }}>{t('noSignals')}</p>
+            : <ul style={{ marginTop: 4, paddingLeft: 18 }}>
+              {selected.signals.slice(-8).map(item => (
+                <li key={item.id}>{item.provider}: {item.signal.type}</li>
+              ))}
+            </ul>}
+        </div>
+        <AutoDevSemanticReview snapshot={selected} remote={remote} t={t} busy={busy} onSnapshotAction={performSnapshotAction} />
+        <div><strong>{t('memory')}</strong>
+          <p style={{ margin: '4px 0' }}>{selected.memories.length} {t('memoryItems')} · {selected.knowledge.length} {t('knowledgeItems')} · {selected.concepts.length} {t('conceptItems')} · {selected.playbooks.length} {t('playbookItems')}</p>
+          {selected.memories.slice(-3).map(item => <p key={item.id} style={{ margin: '4px 0' }}>{item.status}: {item.title}</p>)}
+        </div>
+        <AutoDevKnowledgeReview snapshot={selected} remote={remote} t={t} busy={busy} onSnapshotAction={performSnapshotAction} />
+        <AutoDevKnowledgeLifecycle snapshot={selected} remote={remote} t={t} busy={busy} onSnapshotAction={performSnapshotAction} />
+        <AutoDevPlaybookReview snapshot={selected} remote={remote} t={t} busy={busy} onSnapshotAction={performSnapshotAction} />
+        <div><strong>{t('sideEffects')}</strong>
+          {selected.actionIntents.length === 0
+            ? <p style={{ margin: '4px 0' }}>{t('noSideEffects')}</p>
+            : <ul style={{ marginTop: 4, paddingLeft: 18 }}>
+              {selected.actionIntents.slice(-6).map(item => (
+                <li key={item.id}>{item.kind}: {item.status} — {item.target}</li>
+              ))}
+            </ul>}
+        </div>
+        <div><strong>{candidateHistory.length > 1 ? t('candidateComparison') : t('diff')}</strong>
+          {candidateHistory.length > 1
+            ? <>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 8, marginTop: 6 }}>
+                <label>{t('compareOlder')}
+                  <select aria-label={t('compareOlder')} value={compareLeftId ?? ''} onChange={(event) => {
+                    const id = event.currentTarget.value
+                    if (id === compareRightId) setCompareRightId(compareLeftId)
+                    setCompareLeftId(id)
+                  }}>
+                    {candidateHistory.map(candidate => (
+                      <option key={candidate.id} value={candidate.id}>
+                        {candidateOptionLabel(candidate)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>{t('compareNewer')}
+                  <select aria-label={t('compareNewer')} value={compareRightId ?? ''} onChange={(event) => {
+                    const id = event.currentTarget.value
+                    if (id === compareLeftId) setCompareLeftId(compareRightId)
+                    setCompareRightId(id)
+                  }}>
+                    {candidateHistory.map(candidate => (
+                      <option key={candidate.id} value={candidate.id}>
+                        {candidateOptionLabel(candidate)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              {compareLeftId !== undefined &&
               compareRightId !== undefined &&
               candidateHistory.find(item => item.id === compareLeftId)?.baseCommit !==
                 candidateHistory.find(item => item.id === compareRightId)?.baseCommit
               && <p style={{ color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('differentCandidateBase')}</p>}
-            {comparisonDiffs === undefined || comparisonDiffs.leftId !== compareLeftId || comparisonDiffs.rightId !== compareRightId
-              ? <p style={{ margin: '4px 0' }}>{t('loadingCandidateDiffs')}</p>
-              : <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 8, marginTop: 8 }}>
-                {([
-                  { id: compareLeftId, content: comparisonDiffs.left, label: t('compareOlder') },
-                  { id: compareRightId, content: comparisonDiffs.right, label: t('compareNewer') },
-                ] as const).map((side) => {
-                  const candidate = candidateHistory.find(item => item.id === side.id)
-                  if (candidate === undefined) return null
-                  const verification = selected.verifications.filter(item => item.candidateId === candidate.id).at(-1)
-                  const evidence = selected.evidence.filter(item => item.candidateId === candidate.id)
-                  return <section key={`${side.label}:${candidate.id}`} aria-label={`${side.label}: ${candidate.id}`} style={{ minWidth: 0, padding: 8, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
-                    <strong>{side.label}</strong>
-                    <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>{t('candidateId')}: {candidate.id}</p>
-                    <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>{t('attempt')}: {candidate.attempt ?? '—'} · {t('plan')}: {candidate.planId}</p>
-                    <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>{t('baseCommit')}: {candidate.baseCommit}</p>
-                    <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>{t('candidateTree')}: {candidate.gitTreeHash}</p>
-                    <p style={{ margin: '4px 0' }}>{t('verification')}: {verification?.status ?? 'UNKNOWN'} · {t('evidence')}: {evidence.length}</p>
-                    {side.content === undefined
-                      ? <p style={{ margin: '4px 0' }}>{candidate.diffAvailable ? t('loadingCandidateDiffs') : t('noDiff')}</p>
-                      : <>
-                        <pre style={{ margin: '4px 0', padding: 8, maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 'var(--dsh-content-font-size-secondary, 13px)', background: 'var(--dsw-alias-bg-module-platform, #f6f7f8)', border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>{side.content.content}</pre>
-                        {side.content.truncated && <small style={{ color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('diffTruncated')}</small>}
-                      </>}
-                  </section>
-                })}
-              </div>}
-          </>
-          : diff === undefined
-            ? <p style={{ margin: '4px 0' }}>{t('noDiff')}</p>
-            : <>
-              <pre style={{ margin: '4px 0', padding: 8, maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap', fontSize: 'var(--dsh-content-font-size-secondary, 13px)', background: 'var(--dsw-alias-bg-module-platform, #f6f7f8)', border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>{diff.content}</pre>
-              {diff.truncated && <small style={{ color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('diffTruncated')}</small>}
-            </>}
-      </div>
-      {selected.gates.length > 0 && <div><strong>{t('gate')}</strong>
-        {selected.gates.slice(-1).map(gate => <div key={gate.id} style={{ marginTop: 4 }}>
-          <p style={{ margin: '4px 0' }}>{gate.status}: {gate.reason}</p>
-          {gate.status === 'OPEN' && <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-            {(['retry', 'rework', 'replan', 'abandon', 'cancel'] as const).filter(action => gate.options.includes(action)).map(action => (
-              <button key={action} type="button" disabled={busy} onClick={() => { void perform(action) }}>{t(action)}</button>
-            ))}
-          </div>}
-        </div>)}
-      </div>}
-      {promotionAllowed && promotionRequested && <div role="group" aria-label={t('promotionReview')} style={{ padding: 12, border: '1px solid var(--dsw-alias-state-warn-secondary, #f7ad31)', borderRadius: 8, background: 'var(--dsw-alias-state-warn-tertiary, #fef5e7)' }}>
-        <strong>{t('promotionReview')}</strong>
-        <p style={{ margin: '4px 0' }}>{t('candidateId')}: {selected.run.candidateId ?? t('unknownCandidate')} · {t('verification')}: {selected.verifications.at(-1)?.status ?? 'UNKNOWN'} · {t('evidence')}: {selected.evidence.length}</p>
-        <button type="button" disabled={busy} onClick={confirmPromotion}>{t('confirmPromotion')}</button>
-        <button type="button" disabled={busy} onClick={() => { setPromotionRequested(false) }}>{t('keepCandidate')}</button>
-      </div>}
-      {selected.gates.length === 0 && <small style={{ color: 'var(--dsw-alias-label-tertiary, #707784)' }}>{t('noGate')}</small>}
-      {!terminal(selected.run.status) && selected.run.status !== 'VERIFY'
+              {comparisonDiffs === undefined || comparisonDiffs.leftId !== compareLeftId || comparisonDiffs.rightId !== compareRightId
+                ? <p style={{ margin: '4px 0' }}>{t('loadingCandidateDiffs')}</p>
+                : <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 8, marginTop: 8 }}>
+                  {([
+                    { id: compareLeftId, content: comparisonDiffs.left, label: t('compareOlder') },
+                    { id: compareRightId, content: comparisonDiffs.right, label: t('compareNewer') },
+                  ] as const).map((side) => {
+                    const candidate = candidateHistory.find(item => item.id === side.id)
+                    if (candidate === undefined) return null
+                    const verification = selected.verifications.filter(item => item.candidateId === candidate.id).at(-1)
+                    const evidence = selected.evidence.filter(item => item.candidateId === candidate.id)
+                    return <section key={`${side.label}:${candidate.id}`} aria-label={`${side.label}: ${candidate.id}`} style={{ minWidth: 0, padding: 8, border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>
+                      <strong>{side.label}</strong>
+                      <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>{t('candidateId')}: {candidate.id}</p>
+                      <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>{t('attempt')}: {candidate.attempt ?? '—'} · {t('plan')}: {candidate.planId}</p>
+                      <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>{t('baseCommit')}: {candidate.baseCommit}</p>
+                      <p style={{ margin: '4px 0', overflowWrap: 'anywhere' }}>{t('candidateTree')}: {candidate.gitTreeHash}</p>
+                      <p style={{ margin: '4px 0' }}>{t('verification')}: {verification?.status ?? 'UNKNOWN'} · {t('evidence')}: {evidence.length}</p>
+                      {side.content === undefined
+                        ? <p style={{ margin: '4px 0' }}>{candidate.diffAvailable ? t('loadingCandidateDiffs') : t('noDiff')}</p>
+                        : <>
+                          <pre style={{ margin: '4px 0', padding: 8, maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 'var(--dsh-content-font-size-secondary, 13px)', background: 'var(--dsw-alias-bg-module-platform, #f6f7f8)', border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>{side.content.content}</pre>
+                          {side.content.truncated && <small style={{ color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('diffTruncated')}</small>}
+                        </>}
+                    </section>
+                  })}
+                </div>}
+            </>
+            : diff === undefined
+              ? <p style={{ margin: '4px 0' }}>{t('noDiff')}</p>
+              : <>
+                <pre style={{ margin: '4px 0', padding: 8, maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap', fontSize: 'var(--dsh-content-font-size-secondary, 13px)', background: 'var(--dsw-alias-bg-module-platform, #f6f7f8)', border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))', borderRadius: 8 }}>{diff.content}</pre>
+                {diff.truncated && <small style={{ color: 'var(--dsw-alias-state-warn-label, #a76513)' }}>{t('diffTruncated')}</small>}
+              </>}
+        </div>
+        {selected.gates.length > 0 && <div><strong>{t('gate')}</strong>
+          {selected.gates.slice(-1).map(gate => <div key={gate.id} style={{ marginTop: 4 }}>
+            <p style={{ margin: '4px 0' }}>{gate.status}: {gate.reason}</p>
+            {gate.status === 'OPEN' && <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {(['retry', 'rework', 'replan', 'abandon', 'cancel'] as const).filter(action => gate.options.includes(action)).map(action => (
+                <button key={action} type="button" disabled={busy} onClick={() => { void perform(action) }}>{t(action)}</button>
+              ))}
+            </div>}
+          </div>)}
+        </div>}
+        {promotionAllowed && promotionRequested && <div role="group" aria-label={t('promotionReview')} style={{ padding: 12, border: '1px solid var(--dsw-alias-state-warn-secondary, #f7ad31)', borderRadius: 8, background: 'var(--dsw-alias-state-warn-tertiary, #fef5e7)' }}>
+          <strong>{t('promotionReview')}</strong>
+          <p style={{ margin: '4px 0' }}>{t('candidateId')}: {selected.run.candidateId ?? t('unknownCandidate')} · {t('verification')}: {selected.verifications.at(-1)?.status ?? 'UNKNOWN'} · {t('evidence')}: {selected.evidence.length}</p>
+          <button type="button" disabled={busy} onClick={confirmPromotion}>{t('confirmPromotion')}</button>
+          <button type="button" disabled={busy} onClick={() => { setPromotionRequested(false) }}>{t('keepCandidate')}</button>
+        </div>}
+        {selected.gates.length === 0 && <small style={{ color: 'var(--dsw-alias-label-tertiary, #707784)' }}>{t('noGate')}</small>}
+        {!terminal(selected.run.status) && selected.run.status !== 'VERIFY'
         && !(latestGate?.status === 'OPEN' && latestGate.options.includes('cancel'))
         && <p><button type="button" disabled={busy} onClick={() => { void perform('cancel') }}>{t('cancel')}</button></p>}
-      {promotionAllowed && !promotionRequested && <p><button type="button" disabled={busy} onClick={requestPromotion}>{t('promote')}</button></p>}
-    </article>}
+        {promotionAllowed && !promotionRequested && <p><button type="button" disabled={busy} onClick={requestPromotion}>{t('promote')}</button></p>}
+      </article>}
+      {selected === undefined && <div className={styles.emptyState} hidden={activeTab !== 'details'}>
+        <p>{t('noSelectedRun')}</p>
+        <button type="button" onClick={() => { setActiveTab('create') }}>{t('openTaskCreation')}</button>
+      </div>}
+    </div>
     <span hidden>{tab.id}</span>
   </section>
 }

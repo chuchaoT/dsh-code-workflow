@@ -31,6 +31,13 @@ describe('AutoDevPanel DSH styling', () => {
     expect(css).toContain('box-shadow: 0 0 0 3px')
   })
 
+  it('keeps workspace tabs visible beside tall panels and hides inactive panels', () => {
+    expect(rule('.tabList')).toContain('flex: 0 0 auto')
+    expect(rule('.tabList')).toContain('overflow-x: auto')
+    expect(rule(".tabButton[aria-selected='true']")).toContain('var(--dsw-alias-bg-layer-1')
+    expect(rule('.tabPanel [hidden]')).toContain('display: none !important')
+  })
+
   it('visually distinguishes destructive cleanup confirmation from standard actions', () => {
     expect(rule('.dangerButton')).toContain('var(--dsw-alias-state-error-primary')
     expect(rule('.root [data-autodev-cleanup-confirmation]')).toContain('var(--dsw-alias-state-error-secondary')

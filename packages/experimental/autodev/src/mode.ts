@@ -61,11 +61,29 @@ export function createModePlanNodes(mode: AutoDevMode, buildDriverId?: BuildDriv
       routeName: 'review',
     }]
   }
-  const nodes: PlanNode[] = [{
+  const nodes: PlanNode[] = []
+  if (mode === 'DEBUG' || mode === 'REFACTOR' || mode === 'TEST') {
+    nodes.push({
+      id: 'analyze', kind: 'analyze',
+      description: mode === 'DEBUG'
+        ? 'Read-only reproduction and root-cause analysis before any fix'
+        : mode === 'REFACTOR'
+          ? 'Read-only behavior and compatibility inventory before refactoring'
+          : 'Read-only test gap and regression-scope analysis before changing tests',
+      dependencies: [], expectedOutputs: ['analysis report'], routeName: 'review',
+    })
+  } else if (mode === 'DATABASE') {
+    nodes.push({
+      id: 'impact', kind: 'impact',
+      description: 'Read-only schema, migration, compatibility, and rollback impact analysis',
+      dependencies: [], expectedOutputs: ['database impact report'], routeName: 'review',
+    })
+  }
+  nodes.push({
     id: 'implement', kind: 'implement',
     description: `${mode} — ${AUTODEV_MODE_REGISTRY[mode].instruction}`,
-    dependencies: [], expectedOutputs: ['source diff'], routeName: 'implement',
-  }]
+    dependencies: nodes.map(node => node.id), expectedOutputs: ['source diff'], routeName: 'implement',
+  })
   if (buildDriverId !== undefined) {
     nodes.push({ id: 'build', kind: 'build', description: `Run ${buildDriverId} build and capture immutable evidence`, dependencies: ['implement'], expectedOutputs: ['BUILD PASS'] })
     nodes.push({ id: 'test', kind: 'test', description: `Run ${buildDriverId} tests and capture immutable evidence`, dependencies: ['build'], expectedOutputs: ['TEST PASS'] })

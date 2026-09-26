@@ -7,11 +7,14 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
 import {
   query as officialQuery,
   type Options,
   type Query,
   type SDKMessage,
+  type SDKPartialAssistantMessage,
   type SDKResultMessage,
   type SpawnOptions,
 } from '@anthropic-ai/claude-agent-sdk'
@@ -72,9 +75,18 @@ type ClaudeCodeFailureCategory =
   | 'process'
   | 'unknown'
 
+type ClaudeCodeFailureReason =
+  | 'sdk-result-not-success'
+  | 'sdk-result-marked-error'
+  | 'sdk-result-empty'
+  | 'workspace-mismatch'
+  | 'workspace-not-reported'
+  | 'terminal-result-missing'
+
 interface ClaudeCodeFailureFacts {
   readonly stage: ClaudeCodeFailureStage
   readonly category: ClaudeCodeFailureCategory
+  readonly reason?: ClaudeCodeFailureReason
   readonly outcome?: SubprocessOutcome | undefined
 }
 
@@ -92,7 +104,8 @@ function failureDiagnostic(facts: ClaudeCodeFailureFacts): string {
   if (signal !== null && signal !== undefined) {
     fields.push(`signal: ${signal}`)
   }
-  return `Product subagent failure (${fields.join('; ')})`
+  const details = facts.reason === undefined ? '' : `; reason: ${facts.reason}`
+  return `Product subagent failure (${fields.join('; ')})${details}`
 }
 
 class ClaudeCodeFailure extends Error {
@@ -169,6 +182,24 @@ function thrown(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value))
 }
 
+function matchesWorkspacePath(requested: string, actual: string): boolean {
+  if (typeof actual !== 'string' || !isAbsolute(actual)) return false
+  const requestedPath = resolve(requested)
+  const actualPath = resolve(actual)
+  const normalize = (value: string): string => process.platform === 'win32' ? value.toLowerCase() : value
+  let expectedCanonical: string
+  try {
+    expectedCanonical = realpathSync(requestedPath)
+  } catch {
+    return normalize(requestedPath) === normalize(actualPath)
+  }
+  try {
+    return normalize(expectedCanonical) === normalize(realpathSync(actualPath))
+  } catch {
+    return false
+  }
+}
+
 /** Read live request cancellation across awaited startup cleanup. */
 function isAborted(signal: AbortSignal): boolean {
   return signal.aborted
@@ -210,7 +241,7 @@ export function successfulResult(message: SDKResultMessage): string {
       ? undefined
       : message.errors.join('; ')
     throw new ClaudeCodeFailure(
-      { stage: 'query-run', category },
+      { stage: 'query-run', category, reason: 'sdk-result-not-success' },
       detail === undefined || detail.length === 0
         ? undefined
         : new Error(detail),
@@ -220,6 +251,7 @@ export function successfulResult(message: SDKResultMessage): string {
     throw new ClaudeCodeFailure({
       stage: 'query-run',
       category: 'invalid-result',
+      reason: message.is_error ? 'sdk-result-marked-error' : 'sdk-result-empty',
     })
   }
   return message.result
@@ -231,27 +263,72 @@ export function successfulResult(message: SDKResultMessage): string {
  * @param query - published official SDK query.
  * @param onPermissionDenied - records a safe fact when the SDK reports native denial.
  * @param onResult - records that the SDK supplied a terminal result message.
+ * @param expectedCwd - requested Worktree that the SDK init message must confirm.
  * @returns the completed shared result.
  */
 export async function consumeClaudeQuery(
   query: AsyncIterable<SDKMessage>,
   onPermissionDenied?: () => void,
   onResult?: () => void,
+  expectedCwd?: string,
+  onProgress?: (event: import('@deepseek-ai/dsh-subagent').SubagentProgressEvent) => void,
 ): Promise<SubagentResult> {
   let answer: string | undefined
+  let workspaceConfirmed = expectedCwd === undefined
+  const activeToolBlocks = new Set<number>()
+  const emitProgress = (event: import('@deepseek-ai/dsh-subagent').SubagentProgressEvent): void => {
+    try {
+      onProgress?.(event)
+    } catch {
+      // A progress observer is never allowed to fail the Claude run.
+    }
+  }
   for await (const message of query) {
+    if (expectedCwd !== undefined && message.type === 'system' && message.subtype === 'init') {
+      if (!matchesWorkspacePath(expectedCwd, message.cwd)) {
+        throw new ClaudeCodeFailure(
+          { stage: 'query-run', category: 'invalid-result', reason: 'workspace-mismatch' },
+          new Error('subagent-claude-code: SDK initialized outside the requested workspace'),
+        )
+      }
+      workspaceConfirmed = true
+    }
     if (message.type === 'system' && message.subtype === 'permission_denied') {
       onPermissionDenied?.()
+      continue
+    }
+    if (message.type === 'stream_event') {
+      const partial = message as SDKPartialAssistantMessage
+      // Do not forward nested-agent content or any tool input/result. Only
+      // root text deltas and tool activity are safe for the progress surface.
+      if (partial.parent_tool_use_id === null) {
+        const event = partial.event
+        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          emitProgress({ type: 'assistant-delta', text: event.delta.text })
+        } else if (event.type === 'content_block_start' && event.content_block.type === 'tool_use') {
+          activeToolBlocks.add(event.index)
+          emitProgress({ type: 'activity', activity: 'tool-started' })
+        } else if (event.type === 'content_block_stop' && activeToolBlocks.delete(event.index)) {
+          emitProgress({ type: 'activity', activity: 'tool-completed' })
+        }
+      }
       continue
     }
     if (message.type !== 'result') continue
     onResult?.()
     answer = successfulResult(message)
   }
+  if (!workspaceConfirmed) {
+    throw new ClaudeCodeFailure(
+      { stage: 'query-run', category: 'invalid-result', reason: 'workspace-not-reported' },
+      new Error('subagent-claude-code: SDK did not report its initialized workspace'),
+    )
+  }
   if (answer === undefined) {
     throw new ClaudeCodeFailure({
       stage: 'query-run',
       category: 'invalid-result',
+      reason: 'terminal-result-missing',
     })
   }
   return {
@@ -328,6 +405,7 @@ export function claudeQueryOptions(
     ...spec.model === undefined ? {} : { model: spec.model },
     env: { ...scrubbedParentEnv(), ...spec.env },
     persistSession: false,
+    includePartialMessages: true,
     disallowedTools: spec.permissionMode === 'plan'
       ? ['AskUserQuestion', 'ExitPlanMode']
       : ['AskUserQuestion'],
@@ -519,6 +597,18 @@ export async function startClaudeCodeRun(
   const publishedChild = child
   const publishedProcessFailure = childProcessFailure
   let receivedResult = false
+  let partialOutput = ''
+  const reportProgress = (event: import('@deepseek-ai/dsh-subagent').SubagentProgressEvent): void => {
+    if (event.type === 'assistant-delta') {
+      partialOutput += event.text
+      if (partialOutput.length > 128_000) partialOutput = partialOutput.slice(-128_000)
+    }
+    try {
+      request.onProgress?.(event)
+    } catch {
+      // The observer is telemetry; SDK execution remains authoritative.
+    }
+  }
   const result = settleRunResult({
     attempt: async () => {
       try {
@@ -532,7 +622,7 @@ export async function startClaudeCodeRun(
             ))
           }, () => {
             receivedResult = true
-          }),
+          }, spec.cwd, reportProgress),
           publishedProcessFailure,
         ])
       } catch (error: unknown) {
@@ -560,7 +650,9 @@ export async function startClaudeCodeRun(
           : new ClaudeCodeFailure(facts, thrown(error))
       }
     },
-    collectOutput: () => [],
+    collectOutput: () => partialOutput.length === 0
+      ? []
+      : [{ type: 'text', text: partialOutput }],
     collectDiagnostic: () => diagnostic,
     cancelled: () => controller.signal.aborted,
     onError: spec.onError,

@@ -61,7 +61,7 @@ function createTool(runtime: AutoDevRuntime) {
       request: { type: 'string', required: true, description: 'The software change to implement.' },
       mode: { type: 'string', enum: ['AUTO', 'EXPLORE', 'IMPACT', 'DEV', 'DEBUG', 'DATABASE', 'REFACTOR', 'TEST', 'REVIEW', 'RELEASE'], description: 'Optional explicit engineering mode. AUTO or omission enables intent classification; an explicitly selected mode always wins.' },
       acceptance_criteria: { type: 'array', items: { type: 'string' }, description: 'Optional explicit acceptance checks.' },
-      build_driver: { type: 'string', enum: ['maven', 'gradle', 'node', 'pytest'], description: 'Optional driver when the repository root contains more than one supported project marker.' },
+      build_driver: { type: 'string', enum: ['maven', 'gradle', 'node', 'pytest'], description: 'Optional explicit Build/Test driver. Select one for a greenfield repository when project files will be generated inside the isolated Worktree; auto-detection requires root project markers.' },
       goal_id: { type: 'string', description: 'Optional existing DSH Goal id; Goal remains distinct from this execution Run.' },
       scope: {
         type: 'object',
