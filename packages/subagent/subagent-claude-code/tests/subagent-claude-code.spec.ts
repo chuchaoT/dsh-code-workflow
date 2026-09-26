@@ -1155,12 +1155,12 @@ describe('run publication, cancellation, and settlement', () => {
         env: options.env!,
         signal: options.abortController!.signal,
       }))
-      return Object.assign(stream(options.abortController!), { close: vi.fn() }) as unknown as Query
+      return Object.assign(stream(options.abortController!.signal), { close: vi.fn() }) as unknown as Query
     })
     const run = await startClaudeCodeRun(
       request(undefined, controller.signal, (event) => {
         progress(event)
-        if (event.type === 'assistant-delta') received.resolve()
+        if (event.type === 'assistant-delta') received.resolve(undefined)
       }),
       {
         cwd: '/workspace',
